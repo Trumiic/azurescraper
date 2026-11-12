@@ -24,6 +24,29 @@ export interface Product {
   scrapedAt: string;        // ISO timestamp
 }
 
+/** One line of a nutrition facts label. */
+export interface Nutrient {
+  name: string;
+  amount?: number;
+  unit?: string;
+  dailyValue?: number; // % daily value
+}
+
+export interface NutritionFacts {
+  servingSize?: string;
+  servingsPerPackage?: string;
+  nutrients: Nutrient[];
+}
+
+/** Full product record, fetched one product at a time when saving to the database. */
+export interface ProductDetails extends Product {
+  locationId?: string;
+  nutrition?: NutritionFacts;
+  ingredients?: string;
+  /** Anything else useful the store returns (romance copy, allergens, ...). */
+  extra?: Record<string, unknown>;
+}
+
 /** A physical store / location the user can pick (prices are per-store). */
 export interface StoreLocation {
   locationId: string;
@@ -51,6 +74,10 @@ export interface ScraperModule {
   findLocations?(zip: string): Promise<StoreLocation[]>;
   /** Optional until the module is implemented. */
   searchProducts?(opts: SearchOptions): Promise<Product[]>;
+  /** Full details for one product (used when saving to the database). */
+  getProductDetails?(productId: string, locationId?: string): Promise<ProductDetails>;
+  /** The store's untouched response for one product (debugging / field discovery). */
+  getRawProduct?(productId: string, locationId?: string): Promise<unknown>;
 }
 
 /** A tile on the home page (Groceries, ...), holding its modules. */

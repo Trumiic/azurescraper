@@ -197,3 +197,10 @@ code { background: var(--bg); padding: 2px 6px; border-radius: 6px; font-size: .
 .price .was { color: var(--muted); text-decoration: line-through; font-weight: 400; font-size: .85rem; margin-left: 6px; }
 .price .sale { color: var(--ok); }
 .product a.link { color: var(--azure); font-size: .8rem; }
+
+/* ---------- Save to database ---------- */
+.save-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.card-links { display: flex; justify-content: space-between; align-items: center; }
+.product a.link.muted { color: var(--muted); }
+.save-btn { margin-top: 8px; width: 100%; }
+.save-btn.saved { color: var(--ok); border-color: #1f5a3c; }

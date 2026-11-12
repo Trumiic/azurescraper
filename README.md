@@ -54,6 +54,42 @@ The app has no login, so keep it on your LAN or behind your reverse proxy's auth
 
 Prices and stock levels only come back when a store (`locationId`) is selected.
 
+## Saving items to PostgreSQL
+
+1. Settings -> Connections -> **PostgreSQL**: host (e.g. `192.168.1.76`), port, database, user,
+   password. Optional: table name (default `grocery_items`). Click **Test**, then **Save**.
+2. On the Kroger page pick a store, search, then click **Save to database** on a product or
+   **Save all to database**. Saved products show **In database**.
+
+Each save fetches the full product (`/products/{id}`) so nutrition facts and ingredients are
+included when Kroger provides them. Re-saving updates the existing row (matched on
+`store` + `store_product_id`) and never erases a known price, nutrition, ingredients or image.
+The **Raw** link on a product card shows Kroger's untouched JSON for that product.
+
+The table is created automatically on first save:
+
+```sql
+CREATE TABLE IF NOT EXISTS grocery_items (
+  id                BIGSERIAL PRIMARY KEY,
+  store             TEXT NOT NULL,          -- kroger, walmart, ...
+  store_product_id  TEXT NOT NULL,          -- the store's product id
+  item_name         TEXT NOT NULL,
+  item_price        NUMERIC(10,2),          -- regular price at the chosen store
+  item_upc          TEXT,
+  item_url          TEXT,                   -- product page on the store's site
+  item_detail       JSONB,                  -- brand, size, promoPrice, stockLevel, aisle, categories, locationId, scrapedAt
+  item_nf           JSONB,                  -- {servingSize, servingsPerPackage, nutrients:[{name, amount, unit, dailyValue}]}
+  item_ingredients  TEXT,
+  item_image        TEXT,                   -- image / thumbnail URL
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (store, store_product_id)
+);
+```
+
+All writes go through `saveItems()` in `src/core/items.ts`, which the planned Redis job
+worker (automatic pulls) will reuse.
+
 ## Project layout
 
 ```
@@ -63,6 +99,8 @@ src/
   core/types.ts                 Product / ScraperModule / Category contracts
   core/registry.ts              which categories and modules exist
   core/connections.ts           saved API keys + provider registry
+  core/db.ts                    PostgreSQL connection (Settings -> Connections)
+  core/items.ts                 grocery_items table: create, save, lookup
   modules/groceries/kroger/     Kroger API client + normalizer
   modules/groceries/planned.ts  placeholders for the other stores
 public/                         plain HTML/CSS/JS UI

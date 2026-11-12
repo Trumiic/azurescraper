@@ -17,6 +17,8 @@ import {
   publicView,
   upsertConnection,
 } from "./core/connections.js";
+import { currentTable, dbConfigured } from "./core/db.js";
+import { createTableSql, savedIds, saveItems } from "./core/items.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
@@ -35,6 +37,7 @@ const moduleInfo = (m: ScraperModule) => ({
   status: m.status(),
   canFindLocations: Boolean(m.findLocations),
   canSearch: Boolean(m.searchProducts),
+  canSave: Boolean(m.getProductDetails),
 });
 
 const categoryInfo = (c: Category) => ({
@@ -95,6 +98,85 @@ app.get<{
     start: req.query.start ? Number(req.query.start) : undefined,
   });
 });
+
+/* ---------- Database: save scraped items ---------- */
+
+app.get("/api/db/status", async () => {
+  if (!dbConfigured()) return { configured: false };
+  const table = currentTable();
+  return { configured: true, table, createSql: createTableSql(table).trim() };
+});
+
+/** Run async work over a list with limited parallelism (be polite to store APIs). */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) {
+        const idx = i++;
+        out[idx] = await fn(items[idx]);
+      }
+    }),
+  );
+  return out;
+}
+
+type SaveBody = { productIds?: string[]; locationId?: string };
+
+app.post<{ Params: { cat: string; mod: string }; Body: SaveBody }>(
+  "/api/categories/:cat/modules/:mod/save",
+  async (req) => {
+    const m = findModule(req.params.cat, req.params.mod);
+    if (!m?.getProductDetails) throw new HttpError(404, "This module can't save items yet");
+    if (m.status() !== "ready") throw new HttpError(400, "Module is not configured");
+    if (!dbConfigured()) throw new HttpError(400, "PostgreSQL is not configured. Add it in Settings → Connections.");
+
+    const ids = [...new Set((req.body?.productIds ?? []).map(String).filter(Boolean))];
+    if (!ids.length) throw new HttpError(400, "No products selected");
+    if (ids.length > 50) throw new HttpError(400, "Save at most 50 products at a time");
+
+    // Fetch full details per product (nutrition, ingredients...), then write in one transaction.
+    const results = await mapLimit(ids, 4, async (id) => {
+      try {
+        return { id, item: await m.getProductDetails!(id, req.body.locationId) };
+      } catch (e) {
+        return { id, error: (e as Error).message };
+      }
+    });
+    const ok = results.filter((r) => r.item).map((r) => r.item!);
+    await saveItems(ok);
+    return {
+      saved: ok.map((p) => p.productId),
+      withNutrition: ok.filter((p) => p.nutrition?.nutrients.length).length,
+      withIngredients: ok.filter((p) => p.ingredients).length,
+      failed: results.filter((r) => r.error).map((r) => ({ productId: r.id, error: r.error })),
+    };
+  },
+);
+
+app.post<{ Params: { cat: string; mod: string }; Body: { productIds?: string[] } }>(
+  "/api/categories/:cat/modules/:mod/saved",
+  async (req) => {
+    if (!dbConfigured()) return { configured: false, saved: [] };
+    try {
+      return { configured: true, saved: await savedIds(req.params.mod, (req.body?.productIds ?? []).map(String)) };
+    } catch (e) {
+      return { configured: true, saved: [], error: (e as Error).message };
+    }
+  },
+);
+
+// Untouched store response for one product: handy for seeing which fields exist.
+app.get<{ Params: { cat: string; mod: string; id: string }; Querystring: { locationId?: string } }>(
+  "/api/categories/:cat/modules/:mod/raw/:id",
+  async (req) => {
+    const m = findModule(req.params.cat, req.params.mod);
+    if (!m?.getRawProduct) throw new HttpError(404, "Not supported");
+    if (m.status() !== "ready") throw new HttpError(400, "Module is not configured");
+    return m.getRawProduct(req.params.id, req.query.locationId);
+  },
+);
 
 /* ---------- Settings -> Connections ---------- */
 

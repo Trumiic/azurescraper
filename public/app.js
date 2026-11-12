@@ -86,9 +86,10 @@ async function renderCategory(catId) {
 
 /* ---------- Module page ---------- */
 async function renderModule(catId, modId) {
-  const [cat, mod] = await Promise.all([
+  const [cat, mod, db] = await Promise.all([
     api(`/api/categories/${catId}`),
     api(`/api/categories/${catId}/modules/${modId}`),
+    api("/api/db/status").catch(() => ({ configured: false })),
   ]);
   setCrumbs([{ label: "Home", href: "#/" }, { label: cat.name, href: `#/c/${catId}` }, { label: mod.name }]);
 
@@ -130,6 +131,13 @@ async function renderModule(catId, modId) {
       </form>
       <div id="searchMeta" class="meta" style="margin-top:10px"></div>
       <div id="searchError" class="error"></div>
+      ${mod.canSave ? `
+      <div class="save-bar">
+        <button id="saveAll" class="ghost" disabled>Save all to database</button>
+        <span id="saveMsg" class="meta">${db.configured
+          ? `Saves to table <code>${esc(db.table)}</code>`
+          : `Database not set up. Add PostgreSQL in <a href="#/settings/connections" style="color:var(--azure)">Settings → Connections</a>.`}</span>
+      </div>` : ""}
     </div>
 
     <div id="results" class="products"></div>`;
@@ -172,13 +180,62 @@ async function renderModule(catId, modId) {
       const params = new URLSearchParams({ q });
       if (sel?.value) params.set("locationId", sel.value);
       const items = await api(`${base}/search?${params}`);
+      lastItems = items;
       meta.textContent = `${items.length} results${sel?.value ? "" : " · pick a store to see prices"}`;
-      results.innerHTML = items.map(productCard).join("");
+      results.innerHTML = items.map((p) => productCard(p, { canSave: mod.canSave, dbReady: db.configured, base, locationId: sel?.value })).join("");
+      const saveAll = document.getElementById("saveAll");
+      if (saveAll) saveAll.disabled = !db.configured || !items.length;
+      refreshSaved();
     } catch (e) { meta.textContent = ""; err.textContent = e.message; }
+  });
+
+  /* ----- Saving to the database ----- */
+  let lastItems = [];
+  const results = document.getElementById("results");
+
+  function markSaved(ids) {
+    for (const id of ids) {
+      const btn = results.querySelector(`[data-save="${CSS.escape(id)}"]`);
+      if (btn) { btn.textContent = "✓ In database"; btn.classList.add("saved"); }
+    }
+  }
+
+  async function refreshSaved() {
+    if (!mod.canSave || !db.configured || !lastItems.length) return;
+    const r = await api(`${base}/saved`, { method: "POST", body: { productIds: lastItems.map((p) => p.productId) } }).catch(() => null);
+    if (r?.saved) markSaved(r.saved);
+  }
+
+  async function save(ids, btns) {
+    const msg = document.getElementById("saveMsg");
+    btns.forEach((b) => { b.disabled = true; b.dataset.label = b.textContent; b.textContent = "Saving…"; });
+    try {
+      const r = await api(`${base}/save`, { method: "POST", body: { productIds: ids, locationId: sel?.value || undefined } });
+      markSaved(r.saved);
+      const parts = [`Saved ${r.saved.length} item${r.saved.length === 1 ? "" : "s"}`];
+      if (r.saved.length) parts.push(`${r.withNutrition} with nutrition facts, ${r.withIngredients} with ingredients`);
+      if (r.failed.length) parts.push(`${r.failed.length} failed: ${r.failed[0].error}`);
+      msg.className = r.failed.length ? "result bad" : "result ok";
+      msg.textContent = parts.join(" · ");
+    } catch (e) {
+      msg.className = "result bad"; msg.textContent = e.message;
+    } finally {
+      btns.forEach((b) => { b.disabled = false; if (!b.classList.contains("saved")) b.textContent = b.dataset.label; });
+    }
+  }
+
+  results.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-save]");
+    if (btn) save([btn.dataset.save], [btn]);
+  });
+
+  document.getElementById("saveAll")?.addEventListener("click", (e) => {
+    save(lastItems.map((p) => p.productId), [e.currentTarget]);
   });
 }
 
-function productCard(p) {
+function productCard(p, { canSave, dbReady, base, locationId } = {}) {
+  const rawUrl = base ? `${base}/raw/${encodeURIComponent(p.productId)}${locationId ? `?locationId=${encodeURIComponent(locationId)}` : ""}` : "";
   const onSale = typeof p.promoPrice === "number" && p.promoPrice < (p.price ?? Infinity);
   return `
     <div class="product">
@@ -192,7 +249,11 @@ function productCard(p) {
             ? `<span class="sale">${money(p.promoPrice)}</span><span class="was">${money(p.price)}</span>`
             : money(p.price)}
         </div>
-        ${p.url ? `<a class="link" href="${esc(p.url)}" target="_blank" rel="noopener">View on site ↗</a>` : ""}
+        <div class="card-links">
+          ${p.url ? `<a class="link" href="${esc(p.url)}" target="_blank" rel="noopener">View on site ↗</a>` : ""}
+          ${rawUrl ? `<a class="link muted" href="${esc(rawUrl)}" target="_blank" rel="noopener" title="Raw API data">Raw</a>` : ""}
+        </div>
+        ${canSave ? `<button class="ghost small save-btn" data-save="${esc(p.productId)}" ${dbReady ? "" : "disabled"}>Save to database</button>` : ""}
       </div>
     </div>`;
 }
