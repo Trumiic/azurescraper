@@ -1,0 +1,14 @@
+services:
+  azurescraper:
+    build: .
+    image: azurescraper:latest
+    container_name: azurescraper
+    ports:
+      - "3933:3933"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # On Unraid: /mnt/user/appdata/azurescraper
+      - ./data:/data
+    restart: unless-stopped
