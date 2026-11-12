@@ -78,6 +78,13 @@ export interface ScraperModule {
   getProductDetails?(productId: string, locationId?: string): Promise<ProductDetails>;
   /** The store's untouched response for one product (debugging / field discovery). */
   getRawProduct?(productId: string, locationId?: string): Promise<unknown>;
+  /**
+   * Current prices for many saved products at once (price update job).
+   * Returns the products it could price; `calls` = API calls used.
+   */
+  refreshPrices?(productIds: string[], locationId: string): Promise<{ products: ProductDetails[]; calls: number }>;
+  /** Crawl limits for this store's search (page size, deepest page). */
+  crawl?: { pageSize: number; maxPages: number; dailyCalls(): { used: number; remaining: number; budget: number } };
 }
 
 /** A tile on the home page (Groceries, ...), holding its modules. */

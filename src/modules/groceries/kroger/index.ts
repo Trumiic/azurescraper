@@ -1,6 +1,6 @@
 import type { Nutrient, NutritionFacts, Product, ProductDetails, ScraperModule, StoreLocation } from "../../../core/types.js";
 import { registerProvider } from "../../../core/connections.js";
-import { fetchToken, krogerConfigured, krogerCreds, krogerGet } from "./client.js";
+import { fetchToken, krogerConfigured, krogerCreds, krogerGet, krogerUsage } from "./client.js";
 
 /* ---------- Connection definition (shows up in Settings -> Connections) ---------- */
 
@@ -20,6 +20,13 @@ registerProvider({
       placeholder: "e.g. 01400943",
       help: "Optional. Used when no store is picked on the Kroger page.",
       env: "KROGER_LOCATION_ID",
+    },
+    {
+      key: "dailyBudget",
+      label: "Daily API call budget",
+      type: "text",
+      placeholder: "8000",
+      help: "Kroger allows 10,000 product calls per day. Crawls and price updates stop at this number.",
     },
   ],
   async test(values) {
@@ -182,6 +189,8 @@ export const kroger: ScraperModule = {
 
   status: () => (krogerConfigured() ? "ready" : "needs-config"),
 
+  crawl: { pageSize: 50, maxPages: 5, dailyCalls: krogerUsage },
+
   async findLocations(zip: string): Promise<StoreLocation[]> {
     const res = await krogerGet<{ data: KrogerLocation[] }>("/locations", {
       "filter.zipCode.near": zip,
@@ -207,6 +216,39 @@ export const kroger: ScraperModule = {
     });
     const now = new Date();
     return res.data.map((p) => normalizeKrogerProduct(p, now));
+  },
+
+  /**
+   * Batch price lookup: 50 product ids per call via filter.productId.
+   * If Kroger ignores the store for batch lookups (no prices come back), falls
+   * back to one call per product for that batch.
+   */
+  async refreshPrices(productIds, locationId) {
+    const products: ProductDetails[] = [];
+    let calls = 0;
+    for (let i = 0; i < productIds.length; i += 50) {
+      const batch = productIds.slice(i, i + 50);
+      const res = await krogerGet<{ data: KrogerProduct[] }>("/products", {
+        "filter.productId": batch.join(","),
+        "filter.locationId": locationId,
+        "filter.limit": 50,
+      });
+      calls++;
+      const now = new Date();
+      let priced = res.data.map((p) => ({ ...normalizeKrogerProduct(p, now), locationId }));
+      if (batch.length > 1 && priced.length && priced.every((p) => p.price === undefined)) {
+        priced = [];
+        for (const id of batch) {
+          const one = await krogerGet<{ data: KrogerProduct }>(`/products/${encodeURIComponent(id)}`, {
+            "filter.locationId": locationId,
+          });
+          calls++;
+          priced.push({ ...normalizeKrogerProduct(one.data, now), locationId });
+        }
+      }
+      products.push(...priced.filter((p) => p.price !== undefined));
+    }
+    return { products, calls };
   },
 
   async getRawProduct(productId, locationId) {

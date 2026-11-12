@@ -140,9 +140,12 @@ async function renderModule(catId, modId) {
       </div>` : ""}
     </div>
 
+    <div id="bulk"></div>
+
     <div id="results" class="products"></div>`;
 
   const sel = document.getElementById("location");
+  mountBulk(document.getElementById("bulk"), base, sel).catch(() => {});
 
   // Restore the last-picked store.
   const saved = store.get(locKey);
@@ -256,6 +259,139 @@ function productCard(p, { canSave, dbReady, base, locationId } = {}) {
         ${canSave ? `<button class="ghost small save-btn" data-save="${esc(p.productId)}" ${dbReady ? "" : "disabled"}>Save to database</button>` : ""}
       </div>
     </div>`;
+}
+
+/* ---------- Bulk tools: crawl + price update ---------- */
+const STAT_LABEL = {
+  found: "found", new: "new", updated: "updated", priced: "priced", unpriced: "no price",
+  pricePoints: "price points", calls: "API calls", errors: "errors",
+};
+
+function statChips(stats = {}) {
+  return Object.entries(stats)
+    .map(([k, v]) => `<span class="chip">${esc(v.toLocaleString())} ${esc(STAT_LABEL[k] ?? k)}</span>`)
+    .join("");
+}
+
+function lastRunLine(run) {
+  if (!run) return `<span class="meta">Never run</span>`;
+  const when = run.finishedAt ? new Date(run.finishedAt).toLocaleString() : "";
+  const cls = run.status === "failed" ? "bad" : run.status === "done" ? "ok" : "";
+  return `<span class="meta">Last run ${esc(when)} · </span><span class="result ${cls}">${esc(run.message ?? run.status)}</span>
+    <div class="chips">${statChips(run.stats)}</div>`;
+}
+
+async function mountBulk(holder, base, sel) {
+  const render = async () => {
+    if (!holder.isConnected) return; // navigated away
+    const s = await api(`${base}/jobs`);
+    if (!s.canCrawl && !s.canUpdatePrices) { holder.innerHTML = ""; return; }
+    const running = s.current?.status === "running" ? s.current : null;
+    const c = s.crawl;
+    const crawlCalls = c ? c.terms.length * c.pagesPerTerm : 0;
+    const priceCalls = s.savedCount ? Math.ceil(s.savedCount / 50) : 0;
+
+    holder.innerHTML = `
+      <div class="panel">
+        <h2>3. Bulk tools <span class="meta">(run in the background, stop at the daily API budget)</span></h2>
+        <div class="meta" style="margin-bottom:14px">
+          ${s.usage ? `API calls today: <b>${s.usage.used.toLocaleString()}</b> / ${s.usage.budget.toLocaleString()} budget` : ""}
+          ${s.savedCount !== null ? ` · <b>${s.savedCount.toLocaleString()}</b> items in database` : ""}
+          ${s.dbConfigured ? "" : ` · <a href="#/settings/connections" style="color:var(--azure)">Add PostgreSQL</a> to use these tools`}
+        </div>
+
+        <div class="bulk-grid">
+          ${s.canCrawl ? `
+          <div class="bulk-card">
+            <h3>Crawl catalog</h3>
+            <p class="meta">Searches every term in the list at the store picked above and saves all results.
+              Up to <b>${crawlCalls.toLocaleString()}</b> calls, up to <b>${(crawlCalls * c.pageSize).toLocaleString()}</b> products.</p>
+            <div class="row">
+              <label class="meta">Pages per term
+                <select id="pages" style="min-width:auto;margin-left:6px">
+                  ${Array.from({ length: c.maxPages }, (_, i) => `<option ${i + 1 === c.pagesPerTerm ? "selected" : ""}>${i + 1}</option>`).join("")}
+                </select>
+              </label>
+              <button class="ghost small" id="editTerms">Edit terms (${c.terms.length})</button>
+            </div>
+            <div id="termsBox" hidden>
+              <textarea id="terms" rows="10" spellcheck="false">${esc(c.terms.join("\n"))}</textarea>
+              <div class="actions"><button class="small" id="saveTerms">Save terms</button>
+                <span class="meta">One search term or brand per line.</span></div>
+            </div>
+            <div class="actions">
+              <button id="startCrawl" ${running || !s.dbConfigured ? "disabled" : ""}>Start crawl</button>
+            </div>
+            <div class="last">${lastRunLine(s.last.crawl)}</div>
+          </div>` : ""}
+
+          ${s.canUpdatePrices ? `
+          <div class="bulk-card">
+            <h3>Update prices</h3>
+            <p class="meta">Refreshes the price of every saved item at the store it was saved from and adds
+              today's point to the price history. About <b>${priceCalls.toLocaleString()}</b> calls.</p>
+            <label class="check"><input type="checkbox" id="priceOverride" /> Use the store picked above for all items</label>
+            <div class="actions">
+              <button id="startPrices" ${running || !s.dbConfigured || !s.savedCount ? "disabled" : ""}>Update prices</button>
+            </div>
+            <div class="last">${lastRunLine(s.last.prices)}</div>
+          </div>` : ""}
+        </div>
+
+        ${s.current ? `
+        <div class="job ${s.current.status}">
+          <div class="job-head">
+            <b>${s.current.type === "crawl" ? "Crawl" : "Price update"}</b>
+            <span class="pill ${s.current.status === "running" ? "ready" : s.current.status === "failed" ? "needs-config" : "planned"}">${esc(s.current.status)}</span>
+            <span class="meta">${s.current.progress.done.toLocaleString()} / ${s.current.progress.total.toLocaleString()}</span>
+            ${running ? `<button class="danger small" id="cancelJob">Cancel</button>` : ""}
+          </div>
+          <div class="bar"><div style="width:${s.current.progress.total ? Math.round((100 * s.current.progress.done) / s.current.progress.total) : 0}%"></div></div>
+          <div class="chips">${statChips(s.current.stats)}</div>
+          ${s.current.message ? `<div class="result ${s.current.status === "failed" ? "bad" : "ok"}">${esc(s.current.message)}</div>` : ""}
+          <pre class="log">${esc(s.current.log.slice(-12).join("\n"))}</pre>
+        </div>` : ""}
+        <div id="bulkError" class="error"></div>
+      </div>`;
+
+    const err = holder.querySelector("#bulkError");
+    const guard = (fn) => async (e) => {
+      err.textContent = "";
+      try { await fn(e); } catch (x) { err.textContent = x.message; }
+    };
+    const saveSettings = () => api(`${base}/crawl-settings`, {
+      method: "PUT",
+      body: {
+        terms: holder.querySelector("#terms").value.split("\n"),
+        pagesPerTerm: Number(holder.querySelector("#pages").value),
+      },
+    });
+
+    holder.querySelector("#editTerms")?.addEventListener("click", () => {
+      const box = holder.querySelector("#termsBox");
+      box.hidden = !box.hidden;
+    });
+    holder.querySelector("#saveTerms")?.addEventListener("click", guard(async () => { await saveSettings(); await render(); }));
+    holder.querySelector("#pages")?.addEventListener("change", guard(async () => { await saveSettings(); await render(); }));
+    holder.querySelector("#startCrawl")?.addEventListener("click", guard(async () => {
+      if (!sel?.value) throw new Error("Pick a store in step 1 first: prices are per store.");
+      await api(`${base}/jobs/crawl`, { method: "POST", body: { locationId: sel.value } });
+      await render();
+    }));
+    holder.querySelector("#startPrices")?.addEventListener("click", guard(async () => {
+      const override = holder.querySelector("#priceOverride").checked;
+      if (override && !sel?.value) throw new Error("Pick a store in step 1 first.");
+      await api(`${base}/jobs/prices`, { method: "POST", body: { locationId: override ? sel.value : undefined } });
+      await render();
+    }));
+    holder.querySelector("#cancelJob")?.addEventListener("click", guard(async () => {
+      await api(`/api/jobs/${s.current.id}/cancel`, { method: "POST" });
+    }));
+
+    clearTimeout(holder._poll);
+    if (running) holder._poll = setTimeout(render, 1500);
+  };
+  await render();
 }
 
 /* ---------- Settings ---------- */

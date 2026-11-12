@@ -87,8 +87,50 @@ CREATE TABLE IF NOT EXISTS grocery_items (
 );
 ```
 
-All writes go through `saveItems()` in `src/core/items.ts`, which the planned Redis job
-worker (automatic pulls) will reuse.
+### Price history (for charts)
+
+Every save that includes a price also writes a point to `grocery_item_prices`
+(created automatically next to `grocery_items`): one row per item, per store, per day.
+Saving again the same day updates that day's point.
+
+```sql
+CREATE TABLE IF NOT EXISTS grocery_item_prices (
+  id           BIGSERIAL PRIMARY KEY,
+  item_id      BIGINT NOT NULL REFERENCES grocery_items(id) ON DELETE CASCADE,
+  location_id  TEXT NOT NULL DEFAULT '',   -- store the price came from
+  price        NUMERIC(10,2),              -- regular price
+  promo_price  NUMERIC(10,2),              -- sale price, if any
+  recorded_on  DATE NOT NULL DEFAULT CURRENT_DATE,
+  recorded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (item_id, location_id, recorded_on)
+);
+```
+
+Chart query for the grocery app:
+
+```sql
+SELECT recorded_on, price, promo_price
+FROM grocery_item_prices
+WHERE item_id = $1            -- grocery_items.id
+ORDER BY recorded_on;
+```
+
+All writes go through `saveItems()` in `src/core/items.ts`.
+
+## Bulk tools (Kroger page, step 3)
+
+- **Crawl catalog**: searches every term in an editable list (starter list of ~85 grocery
+  terms and categories) at the picked store, 50 products per call, and saves everything.
+  Default 1 page per term is about 85 API calls. Items found under several terms are saved once.
+- **Update prices**: refreshes the price of every saved item at the store it was saved from,
+  50 items per API call, and adds today's price-history point.
+- Jobs run in the background with progress, a log and a Cancel button.
+- **Daily API budget**: Kroger allows 10,000 Products API calls per day. AzureScraper counts
+  calls (`/data/usage.json`) and stops jobs and searches at the budget (default 8,000, change it
+  in Settings -> Connections -> Kroger). Work saved before the stop is kept.
+
+Planned schedule once Redis is added: crawl weekly, price update daily. Both schedules will
+start the same jobs as the buttons (`startCrawl` / `startPriceUpdate` in `src/core/grocery-jobs.ts`).
 
 ## Project layout
 
@@ -100,7 +142,10 @@ src/
   core/registry.ts              which categories and modules exist
   core/connections.ts           saved API keys + provider registry
   core/db.ts                    PostgreSQL connection (Settings -> Connections)
-  core/items.ts                 grocery_items table: create, save, lookup
+  core/items.ts                 grocery_items + price history: create, save, lookup
+  core/jobs.ts                  background job runner (progress, cancel, last run)
+  core/grocery-jobs.ts          crawl + price update jobs, crawl term list
+  core/usage.ts                 daily API call counter
   modules/groceries/kroger/     Kroger API client + normalizer
   modules/groceries/planned.ts  placeholders for the other stores
 public/                         plain HTML/CSS/JS UI

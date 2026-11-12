@@ -7,6 +7,23 @@
  */
 import { config } from "../../../config.js";
 import { resolveValues } from "../../../core/connections.js";
+import { BudgetExceededError, callsToday, countCall } from "../../../core/usage.js";
+
+/** Kroger allows 10,000 Products API calls per day; keep some headroom by default. */
+export const KROGER_DAILY_LIMIT = 10_000;
+const DEFAULT_BUDGET = 8_000;
+const USAGE_KEY = (path: string) => (path.startsWith("/locations") ? "kroger.locations" : "kroger.products");
+
+export function krogerBudget(): number {
+  const n = Number(resolveValues("kroger").dailyBudget);
+  return n > 0 ? Math.min(n, KROGER_DAILY_LIMIT) : DEFAULT_BUDGET;
+}
+
+export function krogerUsage() {
+  const used = callsToday("kroger.products");
+  const budget = krogerBudget();
+  return { used, budget, remaining: Math.max(0, budget - used), limit: KROGER_DAILY_LIMIT };
+}
 
 export interface KrogerCreds {
   clientId: string;
@@ -77,10 +94,18 @@ export async function krogerGet<T>(
     if (v !== undefined && v !== "") qs.set(k, String(v));
   }
   const url = `${config.kroger.baseUrl}${path}?${qs}`;
+  const key = USAGE_KEY(path);
+  if (key === "kroger.products" && callsToday(key) >= krogerBudget()) {
+    throw new BudgetExceededError(
+      `Daily Kroger API budget reached (${krogerBudget()} calls). It resets at midnight UTC; change it in Settings → Connections → Kroger.`,
+    );
+  }
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await getToken();
+    countCall(key);
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${await getToken()}`, Accept: "application/json" },
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
     });
     if (res.status === 401 && attempt === 0) {
       cache = null; // token expired or revoked: fetch a new one and retry

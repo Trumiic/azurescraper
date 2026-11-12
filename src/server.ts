@@ -18,7 +18,9 @@ import {
   upsertConnection,
 } from "./core/connections.js";
 import { currentTable, dbConfigured } from "./core/db.js";
-import { createTableSql, savedIds, saveItems } from "./core/items.js";
+import { countStoreItems, createTableSql, historyTableName, savedIds, saveItems } from "./core/items.js";
+import { cancelJob, jobsFor } from "./core/jobs.js";
+import { getCrawlSettings, setCrawlSettings, startCrawl, startPriceUpdate } from "./core/grocery-jobs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
@@ -104,7 +106,7 @@ app.get<{
 app.get("/api/db/status", async () => {
   if (!dbConfigured()) return { configured: false };
   const table = currentTable();
-  return { configured: true, table, createSql: createTableSql(table).trim() };
+  return { configured: true, table, historyTable: historyTableName(table), createSql: createTableSql(table).trim() };
 });
 
 /** Run async work over a list with limited parallelism (be polite to store APIs). */
@@ -145,11 +147,12 @@ app.post<{ Params: { cat: string; mod: string }; Body: SaveBody }>(
       }
     });
     const ok = results.filter((r) => r.item).map((r) => r.item!);
-    await saveItems(ok);
+    const saved = await saveItems(ok);
     return {
       saved: ok.map((p) => p.productId),
       withNutrition: ok.filter((p) => p.nutrition?.nutrients.length).length,
       withIngredients: ok.filter((p) => p.ingredients).length,
+      pricePoints: saved.pricePoints,
       failed: results.filter((r) => r.error).map((r) => ({ productId: r.id, error: r.error })),
     };
   },
@@ -177,6 +180,72 @@ app.get<{ Params: { cat: string; mod: string; id: string }; Querystring: { locat
     return m.getRawProduct(req.params.id, req.query.locationId);
   },
 );
+
+/* ---------- Bulk jobs: crawl + price update ---------- */
+
+type ModParams = { cat: string; mod: string };
+
+function requireReadyModule(p: ModParams) {
+  const m = findModule(p.cat, p.mod);
+  if (!m) throw new HttpError(404, "Module not found");
+  if (m.status() !== "ready") throw new HttpError(400, "Module is not configured");
+  return m;
+}
+
+app.get<{ Params: ModParams }>("/api/categories/:cat/modules/:mod/jobs", async (req) => {
+  const m = findModule(req.params.cat, req.params.mod);
+  if (!m) throw new HttpError(404, "Module not found");
+  const scope = `${req.params.cat}/${req.params.mod}`;
+  let savedCount: number | null = null;
+  if (dbConfigured()) savedCount = await countStoreItems(m.id).catch(() => null);
+  return {
+    ...jobsFor(scope),
+    canCrawl: Boolean(m.crawl && m.searchProducts),
+    canUpdatePrices: Boolean(m.refreshPrices),
+    usage: m.crawl?.dailyCalls() ?? null,
+    crawl: m.crawl ? { ...getCrawlSettings(scope), pageSize: m.crawl.pageSize, maxPages: m.crawl.maxPages } : null,
+    dbConfigured: dbConfigured(),
+    savedCount,
+  };
+});
+
+app.put<{ Params: ModParams; Body: { terms?: string[]; pagesPerTerm?: number } }>(
+  "/api/categories/:cat/modules/:mod/crawl-settings",
+  async (req) => {
+    const m = findModule(req.params.cat, req.params.mod);
+    if (!m?.crawl) throw new HttpError(404, "Not supported");
+    return setCrawlSettings(
+      `${req.params.cat}/${req.params.mod}`,
+      { terms: req.body?.terms ?? [], pagesPerTerm: Number(req.body?.pagesPerTerm ?? 1) },
+      m.crawl.maxPages,
+    );
+  },
+);
+
+app.post<{ Params: ModParams; Body: { locationId?: string } }>(
+  "/api/categories/:cat/modules/:mod/jobs/crawl",
+  async (req, reply) => {
+    const m = requireReadyModule(req.params);
+    if (!dbConfigured()) throw new HttpError(400, "PostgreSQL is not configured. Add it in Settings → Connections.");
+    const job = startCrawl(`${req.params.cat}/${req.params.mod}`, m, req.body?.locationId || "");
+    return reply.code(202).send(job);
+  },
+);
+
+app.post<{ Params: ModParams; Body: { locationId?: string } }>(
+  "/api/categories/:cat/modules/:mod/jobs/prices",
+  async (req, reply) => {
+    const m = requireReadyModule(req.params);
+    if (!dbConfigured()) throw new HttpError(400, "PostgreSQL is not configured. Add it in Settings → Connections.");
+    const job = startPriceUpdate(`${req.params.cat}/${req.params.mod}`, m, m.id, req.body?.locationId || undefined);
+    return reply.code(202).send(job);
+  },
+);
+
+app.post<{ Params: { id: string } }>("/api/jobs/:id/cancel", async (req) => {
+  cancelJob(req.params.id);
+  return { ok: true };
+});
 
 /* ---------- Settings -> Connections ---------- */
 
