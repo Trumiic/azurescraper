@@ -1,6 +1,7 @@
 import type { Category } from "./types.js";
 import { kroger } from "../modules/groceries/kroger/index.js";
 import { walmart, meijer, target, aldi } from "../modules/groceries/planned.js";
+import { nutrition } from "../modules/groceries/nutrition/index.js";
 
 /**
  * Every category tile on the home page, and the modules inside it.
@@ -12,7 +13,7 @@ export const categories: Category[] = [
     name: "Groceries",
     description: "Prices and product data from grocery stores",
     icon: "🛒",
-    modules: [kroger, walmart, meijer, target, aldi],
+    modules: [kroger, walmart, meijer, target, aldi, nutrition],
   },
 ];
 

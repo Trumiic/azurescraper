@@ -21,6 +21,11 @@ import { currentTable, dbConfigured } from "./core/db.js";
 import { countStoreItems, createTableSql, historyTableName, savedIds, saveItems } from "./core/items.js";
 import { cancelJob, jobsFor } from "./core/jobs.js";
 import { getCrawlSettings, setCrawlSettings, startCrawl, startPriceUpdate } from "./core/grocery-jobs.js";
+import { scheduleFor } from "./core/schedule.js";
+import {
+  applyLookup, clearNutrition, listNutritionItems, lookupItem, NUTRITION_SCOPE, nutritionCounts, startNutritionFill,
+} from "./modules/groceries/nutrition/index.js";
+import { usdaConfigured } from "./modules/groceries/nutrition/usda.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
@@ -40,6 +45,7 @@ const moduleInfo = (m: ScraperModule) => ({
   canFindLocations: Boolean(m.findLocations),
   canSearch: Boolean(m.searchProducts),
   canSave: Boolean(m.getProductDetails),
+  kind: m.kind ?? "store",
 });
 
 const categoryInfo = (c: Category) => ({
@@ -206,6 +212,7 @@ app.get<{ Params: ModParams }>("/api/categories/:cat/modules/:mod/jobs", async (
     crawl: m.crawl ? { ...getCrawlSettings(scope), pageSize: m.crawl.pageSize, maxPages: m.crawl.maxPages } : null,
     dbConfigured: dbConfigured(),
     savedCount,
+    schedule: scheduleFor(scope),
   };
 });
 
@@ -245,6 +252,58 @@ app.post<{ Params: ModParams; Body: { locationId?: string } }>(
 app.post<{ Params: { id: string } }>("/api/jobs/:id/cancel", async (req) => {
   cancelJob(req.params.id);
   return { ok: true };
+});
+
+/* ---------- Nutrition (USDA FoodData / Open Food Facts) ---------- */
+
+function requireDb() {
+  if (!dbConfigured()) throw new HttpError(400, "PostgreSQL is not configured. Add it in Settings → Connections.");
+}
+
+app.get("/api/nutrition/status", async () => {
+  if (!dbConfigured()) return { dbConfigured: false, usdaConfigured: usdaConfigured() };
+  return {
+    dbConfigured: true,
+    usdaConfigured: usdaConfigured(),
+    counts: await nutritionCounts(),
+    ...jobsFor(NUTRITION_SCOPE),
+    schedule: scheduleFor(NUTRITION_SCOPE),
+  };
+});
+
+app.get<{ Querystring: { filter?: "missing" | "has" | "all"; store?: string; q?: string; page?: string } }>(
+  "/api/nutrition/items",
+  async (req) => {
+    requireDb();
+    return listNutritionItems({
+      filter: req.query.filter ?? "missing",
+      store: req.query.store || undefined,
+      q: req.query.q?.trim() || undefined,
+      page: Number(req.query.page ?? 1),
+    });
+  },
+);
+
+app.post<{ Params: { id: string } }>("/api/nutrition/items/:id/lookup", async (req) => {
+  requireDb();
+  return lookupItem(req.params.id);
+});
+
+app.post<{ Params: { id: string }; Body: { source?: "usda" | "off" } }>("/api/nutrition/items/:id/apply", async (req) => {
+  requireDb();
+  if (req.body?.source !== "usda" && req.body?.source !== "off") throw new HttpError(400, "source must be usda or off");
+  return applyLookup(req.params.id, req.body.source);
+});
+
+app.post<{ Params: { id: string } }>("/api/nutrition/items/:id/clear", async (req) => {
+  requireDb();
+  await clearNutrition(req.params.id);
+  return { ok: true };
+});
+
+app.post<{ Body: { store?: string } }>("/api/nutrition/jobs/fill", async (req, reply) => {
+  requireDb();
+  return reply.code(202).send(startNutritionFill(req.body?.store || undefined));
 });
 
 /* ---------- Settings -> Connections ---------- */

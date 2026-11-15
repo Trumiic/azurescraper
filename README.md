@@ -13,6 +13,7 @@ Self-hosted, modular scraper with a web UI. Runs as a Docker container on Unraid
 | Meijer  | Planned | TBD |
 | Target  | Planned | TBD |
 | Aldi    | Planned | TBD |
+| USDA FoodData / Open Food Facts | Working | Adds nutrition facts + ingredients to saved items by UPC |
 
 ## Run locally (Mac)
 
@@ -83,9 +84,13 @@ CREATE TABLE IF NOT EXISTS grocery_items (
   item_image        TEXT,                   -- image / thumbnail URL
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at      TIMESTAMPTZ,            -- last time the store returned this product
+  removed_at        TIMESTAMPTZ,            -- store confirmed it no longer exists (soft remove)
   UNIQUE (store, store_product_id)
 );
 ```
+
+Existing tables are upgraded automatically (new columns are added on startup use).
 
 ### Price history (for charts)
 
@@ -117,6 +122,59 @@ ORDER BY recorded_on;
 
 All writes go through `saveItems()` in `src/core/items.ts`.
 
+## Data rules (all stores)
+
+- **Re-saving updates, never duplicates** (matched on `store` + `store_product_id`), and never
+  erases a known price, nutrition facts, ingredients or image.
+- **Removal is a soft remove.** AzureScraper never deletes items. When a store confirms a saved
+  product no longer exists (exact-ID lookup during the price update, e.g. a 404 for that id),
+  the row gets `removed_at = now()`. Price history is kept. If the product is seen again, the
+  row is restored (`removed_at = NULL`).
+- **Crawls never remove anything**: a product missing from a term search is not proof it is gone.
+- Every store module must follow this through the `refreshPrices` contract in `src/core/types.ts`:
+  only ids the store confirmed are gone go in `missing`, never ids that failed or timed out.
+- The grocery app should only show current items:
+
+```sql
+SELECT * FROM grocery_items WHERE removed_at IS NULL;
+```
+
+`last_seen_at` records when a store last returned the product.
+
+## Nutrition facts (Groceries -> USDA FoodData / Open Food Facts)
+
+Kroger's public API does not include nutrition facts or ingredients, so this module looks
+items up by barcode:
+
+1. **USDA FoodData Central** (tried first): branded and store-brand foods, per-serving label
+   values, public domain. Needs a free API key (Settings -> Connections -> USDA FoodData Central;
+   sign up at <https://fdc.nal.usda.gov/api-key-signup>). 1,000 requests/hour; AzureScraper paces itself.
+2. **Open Food Facts** (fallback): no key. Community data, so completeness varies and some
+   products only have per-100 g values (flagged in the UI). Licensed ODbL: credit Open Food Facts
+   and share any database you publish that is derived from it under ODbL.
+
+Kroger product ids are the UPC without its check digit (`0001111081533` = UPC-A `011110815330`);
+the module converts them. Produce and meat sold by weight have no retail barcode and are skipped.
+
+- **Look up** on an item shows the USDA and Open Food Facts matches side by side; **Use this** saves one.
+- **Clear** removes an item's nutrition facts and ingredients.
+- **Fill all missing** runs as a background job (USDA first, then Open Food Facts). Items not
+  found are retried after 30 days.
+- The source is recorded in `item_detail.nutritionSource` (source, matched name, basis, link).
+
+## Automatic schedule (on standby)
+
+Redis is not set up yet, so nothing runs automatically. The agreed plan, in `src/core/schedule.ts`:
+
+| Job | When |
+|-----|------|
+| Kroger crawl | Weekly (Sunday night) |
+| Kroger price update (also applies the removal rule) | Daily |
+| Nutrition fill | Weekly, after the crawl |
+
+The UI shows each plan as "on standby". When Redis is ready, the scheduler will start the same
+job functions the buttons use.
+
 ## Bulk tools (Kroger page, step 3)
 
 - **Crawl catalog**: searches every term in an editable list (starter list of ~85 grocery
@@ -129,8 +187,7 @@ All writes go through `saveItems()` in `src/core/items.ts`.
   calls (`/data/usage.json`) and stops jobs and searches at the budget (default 8,000, change it
   in Settings -> Connections -> Kroger). Work saved before the stop is kept.
 
-Planned schedule once Redis is added: crawl weekly, price update daily. Both schedules will
-start the same jobs as the buttons (`startCrawl` / `startPriceUpdate` in `src/core/grocery-jobs.ts`).
+- The price update also applies the removal rule (see Data rules).
 
 ## Project layout
 
@@ -146,6 +203,9 @@ src/
   core/jobs.ts                  background job runner (progress, cancel, last run)
   core/grocery-jobs.ts          crawl + price update jobs, crawl term list
   core/usage.ts                 daily API call counter
+  core/ratelimit.ts             waits to stay under hourly/minute limits (USDA, Open Food Facts)
+  core/schedule.ts              planned automatic schedule (standby until Redis)
+  modules/groceries/nutrition/  USDA + Open Food Facts lookups, UPC conversion, fill job
   modules/groceries/kroger/     Kroger API client + normalizer
   modules/groceries/planned.ts  placeholders for the other stores
 public/                         plain HTML/CSS/JS UI

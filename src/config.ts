@@ -10,4 +10,10 @@ export const config = {
   kroger: {
     baseUrl: process.env.KROGER_BASE_URL ?? "https://api.kroger.com/v1",
   },
+  usda: {
+    baseUrl: process.env.USDA_BASE_URL ?? "https://api.nal.usda.gov/fdc/v1",
+  },
+  off: {
+    baseUrl: process.env.OFF_BASE_URL ?? "https://world.openfoodfacts.org",
+  },
 };

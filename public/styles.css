@@ -225,3 +225,26 @@ textarea:focus { outline: none; border-color: var(--azure); }
 .bar div { height: 100%; background: var(--azure); transition: width .4s ease; }
 .job.done .bar div { background: var(--ok); }
 .log { margin: 10px 0 0; max-height: 200px; overflow: auto; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+
+/* ---------- Nutrition page ---------- */
+.sched { margin-top: 6px; }
+.nf-list { display: grid; gap: 8px; }
+.nf-row {
+  display: grid; grid-template-columns: 52px 1fr auto auto; gap: 12px; align-items: center;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px;
+}
+.nf-thumb { width: 52px; height: 52px; background: #fff; border-radius: 8px; display: grid; place-items: center; overflow: hidden; }
+.nf-thumb img { max-width: 90%; max-height: 90%; object-fit: contain; }
+.nf-name { font-weight: 550; }
+.nf-actions { display: flex; gap: 6px; }
+.nf-result { grid-column: 1 / -1; border-top: 1px solid var(--border); padding-top: 10px; }
+.nf-compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.nf-match { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+.nf-match h4 { margin: 0 0 4px; font-size: .85rem; color: var(--azure); }
+.nf-match button { align-self: flex-start; margin-top: 8px; }
+.nf-matched { font-weight: 600; }
+.nf-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: .82rem; }
+.nf-table td { padding: 3px 4px; border-bottom: 1px solid var(--border); }
+.nf-table td:nth-child(2), .nf-table td:nth-child(3) { text-align: right; color: var(--muted); white-space: nowrap; }
+.nf-ingr { font-size: .8rem; color: var(--muted); margin-top: 6px; max-height: 5.5em; overflow: auto; }
+@media (max-width: 700px) { .nf-row { grid-template-columns: 52px 1fr; } }

@@ -80,9 +80,19 @@ export interface ScraperModule {
   getRawProduct?(productId: string, locationId?: string): Promise<unknown>;
   /**
    * Current prices for many saved products at once (price update job).
-   * Returns the products it could price; `calls` = API calls used.
+   * Returns the products it found (priced or not), `calls` = API calls used, and
+   * `missing` = ids the store CONFIRMED no longer exist (exact-ID lookup, e.g. 404).
+   *
+   * Rule for every store module: only put an id in `missing` when the store said
+   * so for that exact id. Never because a search didn't return it, and never on
+   * errors/timeouts. The core then soft-removes it (removed_at), keeping history.
    */
-  refreshPrices?(productIds: string[], locationId: string): Promise<{ products: ProductDetails[]; calls: number }>;
+  refreshPrices?(
+    productIds: string[],
+    locationId: string,
+  ): Promise<{ products: ProductDetails[]; calls: number; missing: string[] }>;
+  /** "store" (default) scrapes a store; "enricher" adds data to saved items (nutrition). */
+  kind?: "store" | "enricher";
   /** Crawl limits for this store's search (page size, deepest page). */
   crawl?: { pageSize: number; maxPages: number; dailyCalls(): { used: number; remaining: number; budget: number } };
 }

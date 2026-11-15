@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { startJob, type JobContext } from "./jobs.js";
-import { listStoreItems, saveItems } from "./items.js";
+import { listStoreItems, markRemoved, saveItems } from "./items.js";
 import type { ProductDetails, ScraperModule } from "./types.js";
 import { BudgetExceededError } from "./usage.js";
 
@@ -131,11 +131,19 @@ export function startPriceUpdate(scope: string, mod: ScraperModule, store: strin
         if (ctx.cancelled) break;
         const chunk = ids.slice(i, i + 50);
         try {
-          const { products, calls } = await mod.refreshPrices!(chunk, loc);
+          const { products, calls, missing } = await mod.refreshPrices!(chunk, loc);
           ctx.stat("calls", calls);
-          ctx.stat("priced", products.length);
-          ctx.stat("unpriced", chunk.length - products.length);
+          const priced = products.filter((p) => p.price !== undefined);
+          ctx.stat("priced", priced.length);
+          ctx.stat("unpriced", products.length - priced.length);
           if (products.length) await saveBatch(ctx, products);
+          if (missing.length) {
+            // Removal rule: soft-remove only what the store confirmed is gone.
+            const removed = await markRemoved(store, missing);
+            ctx.stat("removed", removed.length);
+            for (const name of removed.slice(0, 10)) ctx.log(`Removed (no longer at ${mod.name}): ${name}`);
+            if (removed.length > 10) ctx.log(`…and ${removed.length - 10} more removed`);
+          }
         } catch (e) {
           if (e instanceof BudgetExceededError) throw e;
           ctx.stat("errors");

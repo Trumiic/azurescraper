@@ -1,6 +1,6 @@
 import type { Nutrient, NutritionFacts, Product, ProductDetails, ScraperModule, StoreLocation } from "../../../core/types.js";
 import { registerProvider } from "../../../core/connections.js";
-import { fetchToken, krogerConfigured, krogerCreds, krogerGet, krogerUsage } from "./client.js";
+import { fetchToken, KrogerApiError, krogerConfigured, krogerCreds, krogerGet, krogerUsage } from "./client.js";
 
 /* ---------- Connection definition (shows up in Settings -> Connections) ---------- */
 
@@ -219,36 +219,63 @@ export const kroger: ScraperModule = {
   },
 
   /**
-   * Batch price lookup: 50 product ids per call via filter.productId.
-   * If Kroger ignores the store for batch lookups (no prices come back), falls
-   * back to one call per product for that batch.
+   * Batch price lookup: 50 product ids per call via filter.productId (exact match).
+   * Ids the batch doesn't return are re-checked one by one; only a 404 on that
+   * exact id counts as "missing" (soft-removed by the core).
+   * If Kroger ignores the store on batch lookups (no prices come back), falls back
+   * to one call per product for that batch.
    */
   async refreshPrices(productIds, locationId) {
     const products: ProductDetails[] = [];
+    const missing: string[] = [];
     let calls = 0;
+
+    const fetchOne = async (id: string, now: Date): Promise<ProductDetails | null> => {
+      try {
+        const one = await krogerGet<{ data: KrogerProduct }>(`/products/${encodeURIComponent(id)}`, {
+          "filter.locationId": locationId,
+        });
+        calls++;
+        return { ...normalizeKrogerProduct(one.data, now), locationId };
+      } catch (e) {
+        calls++;
+        if (e instanceof KrogerApiError && e.status === 404) {
+          missing.push(id); // Kroger confirmed this exact product id doesn't exist
+          return null;
+        }
+        throw e;
+      }
+    };
+
     for (let i = 0; i < productIds.length; i += 50) {
       const batch = productIds.slice(i, i + 50);
+      const now = new Date();
       const res = await krogerGet<{ data: KrogerProduct[] }>("/products", {
         "filter.productId": batch.join(","),
         "filter.locationId": locationId,
         "filter.limit": 50,
       });
       calls++;
-      const now = new Date();
-      let priced = res.data.map((p) => ({ ...normalizeKrogerProduct(p, now), locationId }));
-      if (batch.length > 1 && priced.length && priced.every((p) => p.price === undefined)) {
-        priced = [];
+      let found: ProductDetails[] = res.data.map((p) => ({ ...normalizeKrogerProduct(p, now), locationId }));
+
+      // Store ignored on batch lookups? Re-fetch each product individually.
+      if (batch.length > 1 && found.length && found.every((p) => p.price === undefined)) {
+        found = [];
         for (const id of batch) {
-          const one = await krogerGet<{ data: KrogerProduct }>(`/products/${encodeURIComponent(id)}`, {
-            "filter.locationId": locationId,
-          });
-          calls++;
-          priced.push({ ...normalizeKrogerProduct(one.data, now), locationId });
+          const p = await fetchOne(id, now);
+          if (p) found.push(p);
+        }
+      } else {
+        // Confirm ids the batch didn't return before calling them missing.
+        const returned = new Set(found.map((p) => p.productId));
+        for (const id of batch.filter((x) => !returned.has(x))) {
+          const p = await fetchOne(id, now);
+          if (p) found.push(p);
         }
       }
-      products.push(...priced.filter((p) => p.price !== undefined));
+      products.push(...found);
     }
-    return { products, calls };
+    return { products, calls, missing };
   },
 
   async getRawProduct(productId, locationId) {

@@ -12,6 +12,13 @@
  *
  * saveItems() is the single write path: Save buttons, the crawl, the price update
  * and (later) the Redis scheduler all use it.
+ *
+ * REMOVAL RULE (all stores): items are never deleted by AzureScraper. When a store
+ * confirms a saved product no longer exists (exact-ID lookup during the price
+ * update), the row gets removed_at = now() and the grocery app should hide it
+ * (WHERE removed_at IS NULL). Price history is kept. If the product is ever seen
+ * again, saveItems() clears removed_at. Crawls never remove anything: a product
+ * missing from a term search is not proof it is gone.
  */
 import { currentTable, getPool, quoteIdent } from "./db.js";
 import type { ProductDetails } from "./types.js";
@@ -39,8 +46,13 @@ CREATE TABLE IF NOT EXISTS ${t} (
   item_image        TEXT,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at      TIMESTAMPTZ,            -- last time the store returned this product
+  removed_at        TIMESTAMPTZ,            -- set when the store confirmed it no longer exists
   UNIQUE (store, store_product_id)
 );
+-- upgrades from earlier versions
+ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS ${quoteIdent(`${table}_upc_idx`)} ON ${t} (item_upc);
 
 CREATE TABLE IF NOT EXISTS ${quoteIdent(h)} (
@@ -58,7 +70,7 @@ CREATE INDEX IF NOT EXISTS ${quoteIdent(`${h}_item_idx`)} ON ${quoteIdent(h)} (i
 
 const ensured = new Set<string>();
 
-async function ensureTable(table: string) {
+export async function ensureTable(table = currentTable()) {
   if (ensured.has(table)) return;
   await getPool().query(createTableSql(table));
   ensured.add(table);
@@ -131,8 +143,8 @@ export async function saveItems(items: ProductDetails[]): Promise<SaveResult> {
       const res = await client.query<{ id: string; inserted: boolean }>(
         `INSERT INTO ${t}
            (store, store_product_id, item_name, item_price, item_upc, item_url,
-            item_detail, item_nf, item_ingredients, item_image)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            item_detail, item_nf, item_ingredients, item_image, last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
          ON CONFLICT (store, store_product_id) DO UPDATE SET
            item_name = EXCLUDED.item_name,
            -- Kroger only returns prices for a specific store; don't wipe a known price
@@ -144,7 +156,9 @@ export async function saveItems(items: ProductDetails[]): Promise<SaveResult> {
            item_nf = COALESCE(EXCLUDED.item_nf, ${t}.item_nf),
            item_ingredients = COALESCE(EXCLUDED.item_ingredients, ${t}.item_ingredients),
            item_image = COALESCE(EXCLUDED.item_image, ${t}.item_image),
-           updated_at = now()
+           updated_at = now(),
+           last_seen_at = now(),
+           removed_at = NULL           -- seen again: restore if it had been marked removed
          RETURNING id, (xmax = 0) AS inserted`,
         [
           r.store, r.store_product_id, r.item_name, r.item_price, r.item_upc, r.item_url,
@@ -178,8 +192,25 @@ export async function saveItems(items: ProductDetails[]): Promise<SaveResult> {
   }
 }
 
+/**
+ * Soft-remove: mark products the store confirmed no longer exist.
+ * Returns the names of newly removed items (already-removed ones are left as is).
+ */
+export async function markRemoved(store: string, productIds: string[]): Promise<string[]> {
+  if (!productIds.length) return [];
+  await ensureTable();
+  const res = await getPool().query<{ item_name: string }>(
+    `UPDATE ${quoteIdent(currentTable())} SET removed_at = now(), updated_at = now()
+     WHERE store = $1 AND store_product_id = ANY($2) AND removed_at IS NULL
+     RETURNING item_name`,
+    [store, productIds],
+  );
+  return res.rows.map((r) => r.item_name);
+}
+
 /** All saved items for one store (used by the price update job). */
 export async function listStoreItems(store: string): Promise<{ productId: string; locationId?: string }[]> {
+  await ensureTable();
   const table = currentTable();
   const exists = await getPool().query<{ n: string | null }>("select to_regclass($1) as n", [table]);
   if (!exists.rows[0].n) return [];
@@ -192,6 +223,7 @@ export async function listStoreItems(store: string): Promise<{ productId: string
 }
 
 export async function countStoreItems(store: string): Promise<number> {
+  await ensureTable();
   const table = currentTable();
   const exists = await getPool().query<{ n: string | null }>("select to_regclass($1) as n", [table]);
   if (!exists.rows[0].n) return 0;
@@ -202,6 +234,7 @@ export async function countStoreItems(store: string): Promise<number> {
 
 /** Which of these product ids are already in the table (for "In database" badges). */
 export async function savedIds(store: string, productIds: string[]): Promise<string[]> {
+  await ensureTable();
   if (!productIds.length) return [];
   const table = currentTable();
   const exists = await getPool().query<{ n: string | null }>("select to_regclass($1) as n", [table]);

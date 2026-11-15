@@ -96,13 +96,17 @@ async function renderModule(catId, modId) {
   const base = `/api/categories/${catId}/modules/${modId}`;
   const locKey = `azs.${modId}.location`;
 
+  if (mod.kind === "enricher" && mod.status === "ready") return renderNutrition();
+
   if (mod.status === "needs-config") {
     view.innerHTML = `
       <h1>${esc(mod.name)} <span class="pill needs-config">${STATUS_LABEL[mod.status]}</span></h1>
       <p class="sub">${esc(mod.description)}</p>
       <div class="panel">
         <h2>Setup needed</h2>
-        <p class="notice">Add your ${esc(mod.name)} API keys in
+        <p class="notice">${mod.kind === "enricher"
+          ? "This module works on items in your database: add PostgreSQL in"
+          : `Add your ${esc(mod.name)} API keys in`}
         <a href="#/settings/connections" style="color:var(--azure)">Settings → Connections</a>.</p>
       </div>`;
     return;
@@ -264,8 +268,37 @@ function productCard(p, { canSave, dbReady, base, locationId } = {}) {
 /* ---------- Bulk tools: crawl + price update ---------- */
 const STAT_LABEL = {
   found: "found", new: "new", updated: "updated", priced: "priced", unpriced: "no price",
-  pricePoints: "price points", calls: "API calls", errors: "errors",
+  pricePoints: "price points", calls: "API calls", errors: "errors", removed: "removed",
+  fromUsda: "from USDA", fromOff: "from Open Food Facts", notFound: "not found", noBarcode: "no barcode",
 };
+const JOB_TITLE = { crawl: "Crawl", prices: "Price update", fill: "Nutrition fill" };
+
+function jobBox(job) {
+  if (!job) return "";
+  const running = job.status === "running";
+  const pct = job.progress.total ? Math.round((100 * job.progress.done) / job.progress.total) : 0;
+  return `
+    <div class="job ${job.status}">
+      <div class="job-head">
+        <b>${esc(JOB_TITLE[job.type] ?? job.type)}</b>
+        <span class="pill ${running ? "ready" : job.status === "failed" ? "needs-config" : "planned"}">${esc(job.status)}</span>
+        <span class="meta">${job.progress.done.toLocaleString()} / ${job.progress.total.toLocaleString()}</span>
+        ${running ? `<button class="danger small" data-cancel="${esc(job.id)}">Cancel</button>` : ""}
+      </div>
+      <div class="bar"><div style="width:${pct}%"></div></div>
+      <div class="chips">${statChips(job.stats)}</div>
+      ${job.message ? `<div class="result ${job.status === "failed" ? "bad" : "ok"}">${esc(job.message)}</div>` : ""}
+      <pre class="log">${esc(job.log.slice(-12).join("\n"))}</pre>
+    </div>`;
+}
+
+/** "Automatic: Weekly · on standby until Redis is set up" */
+function scheduleLine(schedule, jobType) {
+  const run = schedule?.runs?.find((r) => r.job === jobType);
+  if (!run) return "";
+  return `<div class="meta sched">Automatic: ${esc(run.every)} ·
+    <span class="${schedule.active ? "result ok" : ""}">${schedule.active ? "active" : esc(schedule.reason)}</span></div>`;
+}
 
 function statChips(stats = {}) {
   return Object.entries(stats)
@@ -322,7 +355,7 @@ async function mountBulk(holder, base, sel) {
             <div class="actions">
               <button id="startCrawl" ${running || !s.dbConfigured ? "disabled" : ""}>Start crawl</button>
             </div>
-            <div class="last">${lastRunLine(s.last.crawl)}</div>
+            <div class="last">${lastRunLine(s.last.crawl)}${scheduleLine(s.schedule, "crawl")}</div>
           </div>` : ""}
 
           ${s.canUpdatePrices ? `
@@ -334,23 +367,11 @@ async function mountBulk(holder, base, sel) {
             <div class="actions">
               <button id="startPrices" ${running || !s.dbConfigured || !s.savedCount ? "disabled" : ""}>Update prices</button>
             </div>
-            <div class="last">${lastRunLine(s.last.prices)}</div>
+            <div class="last">${lastRunLine(s.last.prices)}${scheduleLine(s.schedule, "prices")}</div>
           </div>` : ""}
         </div>
 
-        ${s.current ? `
-        <div class="job ${s.current.status}">
-          <div class="job-head">
-            <b>${s.current.type === "crawl" ? "Crawl" : "Price update"}</b>
-            <span class="pill ${s.current.status === "running" ? "ready" : s.current.status === "failed" ? "needs-config" : "planned"}">${esc(s.current.status)}</span>
-            <span class="meta">${s.current.progress.done.toLocaleString()} / ${s.current.progress.total.toLocaleString()}</span>
-            ${running ? `<button class="danger small" id="cancelJob">Cancel</button>` : ""}
-          </div>
-          <div class="bar"><div style="width:${s.current.progress.total ? Math.round((100 * s.current.progress.done) / s.current.progress.total) : 0}%"></div></div>
-          <div class="chips">${statChips(s.current.stats)}</div>
-          ${s.current.message ? `<div class="result ${s.current.status === "failed" ? "bad" : "ok"}">${esc(s.current.message)}</div>` : ""}
-          <pre class="log">${esc(s.current.log.slice(-12).join("\n"))}</pre>
-        </div>` : ""}
+        ${jobBox(s.current)}
         <div id="bulkError" class="error"></div>
       </div>`;
 
@@ -384,14 +405,205 @@ async function mountBulk(holder, base, sel) {
       await api(`${base}/jobs/prices`, { method: "POST", body: { locationId: override ? sel.value : undefined } });
       await render();
     }));
-    holder.querySelector("#cancelJob")?.addEventListener("click", guard(async () => {
-      await api(`/api/jobs/${s.current.id}/cancel`, { method: "POST" });
+    holder.querySelector("[data-cancel]")?.addEventListener("click", guard(async (e) => {
+      await api(`/api/jobs/${e.currentTarget.dataset.cancel}/cancel`, { method: "POST" });
     }));
 
     clearTimeout(holder._poll);
     if (running) holder._poll = setTimeout(render, 1500);
   };
   await render();
+}
+
+/* ---------- USDA FoodData / Open Food Facts page ---------- */
+async function renderNutrition() {
+  setCrumbs([{ label: "Home", href: "#/" }, { label: "Groceries", href: "#/c/groceries" }, { label: "USDA FoodData / Open Food Facts" }]);
+  const state = { filter: "missing", store: "", q: "", page: 1 };
+
+  view.innerHTML = `
+    <h1>USDA FoodData / Open Food Facts</h1>
+    <p class="sub">Adds nutrition facts and ingredients to items already in your database, matched by barcode (UPC).</p>
+    <div id="nfStatus"></div>
+    <div class="panel">
+      <h2>Items in database</h2>
+      <div class="row">
+        <select id="nfFilter" style="min-width:auto">
+          <option value="missing">Missing nutrition</option>
+          <option value="has">Has nutrition</option>
+          <option value="all">All items</option>
+        </select>
+        <select id="nfStore" style="min-width:auto"><option value="">All stores</option></select>
+        <input id="nfQ" class="grow" placeholder="Search name or UPC" />
+      </div>
+      <div id="nfMeta" class="meta" style="margin:12px 0"></div>
+      <div id="nfList" class="nf-list"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="ghost small" id="nfPrev">← Prev</button>
+        <button class="ghost small" id="nfNext">Next →</button>
+      </div>
+      <div id="nfError" class="error"></div>
+    </div>`;
+
+  const statusEl = document.getElementById("nfStatus");
+  const list = document.getElementById("nfList");
+  const err = document.getElementById("nfError");
+
+  /* ----- sources + fill job ----- */
+  async function renderStatus() {
+    if (!statusEl.isConnected) return;
+    const s = await api("/api/nutrition/status");
+    const running = s.current?.status === "running" ? s.current : null;
+    const c = s.counts ?? { total: 0, has: 0, missing: 0, stores: [] };
+    statusEl.innerHTML = `
+      <div class="panel">
+        <h2>Sources</h2>
+        <div class="bulk-grid">
+          <div class="bulk-card">
+            <h3>USDA FoodData Central <span class="pill ${s.usdaConfigured ? "ready" : "needs-config"}">${s.usdaConfigured ? "Ready" : "Needs API key"}</span></h3>
+            <p class="meta">Tried first. Branded and store-brand foods, per-serving label values. Public domain.
+              ${s.usdaConfigured ? "" : `Add a free key in <a href="#/settings/connections" style="color:var(--azure)">Settings → Connections</a>.`}</p>
+          </div>
+          <div class="bulk-card">
+            <h3>Open Food Facts <span class="pill ready">Ready</span></h3>
+            <p class="meta">Fallback, no key needed. Community data: completeness varies. Data © Open Food Facts contributors, ODbL.</p>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Fill missing <span class="meta">(background job)</span></h2>
+        <p class="meta"><b>${c.has.toLocaleString()}</b> of ${c.total.toLocaleString()} items have nutrition facts ·
+          <b>${c.missing.toLocaleString()}</b> missing. Looks up every missing item (USDA first, then Open Food Facts).
+          Items not found are retried after 30 days.</p>
+        <div class="actions">
+          <button id="nfFill" ${running || !c.missing ? "disabled" : ""}>Fill all missing</button>
+        </div>
+        <div class="last">${lastRunLine(s.last?.fill)}${scheduleLine(s.schedule, "fill")}</div>
+        ${jobBox(s.current)}
+      </div>`;
+
+    const storeSel = document.getElementById("nfStore");
+    if (storeSel.options.length === 1) {
+      for (const st of c.stores) storeSel.insertAdjacentHTML("beforeend", `<option value="${esc(st)}">${esc(st)}</option>`);
+    }
+    statusEl.querySelector("#nfFill")?.addEventListener("click", async () => {
+      err.textContent = "";
+      try { await api("/api/nutrition/jobs/fill", { method: "POST", body: {} }); await renderStatus(); }
+      catch (e) { err.textContent = e.message; }
+    });
+    statusEl.querySelector("[data-cancel]")?.addEventListener("click", async (e) => {
+      await api(`/api/jobs/${e.currentTarget.dataset.cancel}/cancel`, { method: "POST" }).catch(() => {});
+    });
+
+    clearTimeout(statusEl._poll);
+    if (running) statusEl._poll = setTimeout(renderStatus, 1500);
+    else if (statusEl._wasRunning) loadItems(); // job just finished: refresh the list
+    statusEl._wasRunning = Boolean(running);
+  }
+
+  /* ----- item list ----- */
+  function statusBadge(it) {
+    if (it.hasNutrition) {
+      const src = it.source?.source === "usda" ? "USDA" : it.source?.source === "off" ? "Open Food Facts" : "store";
+      return `<span class="pill ready">✓ ${esc(src)}</span>`;
+    }
+    if (it.lastLookup?.result === "nobarcode") return `<span class="pill planned">No barcode</span>`;
+    if (it.lastLookup?.result === "notfound") {
+      return `<span class="pill planned">Not found ${esc(new Date(it.lastLookup.at).toLocaleDateString())}</span>`;
+    }
+    return `<span class="pill needs-config">Missing</span>`;
+  }
+
+  async function loadItems() {
+    err.textContent = "";
+    const qs = new URLSearchParams({ filter: state.filter, store: state.store, q: state.q, page: state.page });
+    try {
+      const r = await api(`/api/nutrition/items?${qs}`);
+      const from = r.total ? (r.page - 1) * r.pageSize + 1 : 0;
+      document.getElementById("nfMeta").textContent =
+        `${from}–${Math.min(r.page * r.pageSize, r.total)} of ${r.total.toLocaleString()} items`;
+      document.getElementById("nfPrev").disabled = r.page <= 1;
+      document.getElementById("nfNext").disabled = r.page * r.pageSize >= r.total;
+      list.innerHTML = r.items.length ? r.items.map((it) => `
+        <div class="nf-row" data-id="${esc(it.id)}">
+          <div class="nf-thumb">${it.image ? `<img src="${esc(it.image)}" alt="" loading="lazy" />` : ""}</div>
+          <div class="nf-info">
+            <div class="nf-name">${esc(it.name)}</div>
+            <div class="meta">${esc(it.store)} · UPC ${esc(it.upc ?? "—")}${it.hasIngredients ? " · ingredients ✓" : ""}</div>
+          </div>
+          <div class="nf-status">${statusBadge(it)}</div>
+          <div class="nf-actions">
+            <button class="ghost small" data-act="lookup">Look up</button>
+            ${it.hasNutrition || it.hasIngredients ? `<button class="danger small" data-act="clear">Clear</button>` : ""}
+          </div>
+          <div class="nf-result" hidden></div>
+        </div>`).join("") : `<div class="empty">No items match.</div>`;
+    } catch (e) { err.textContent = e.message; }
+  }
+
+  function matchCard(m, source, enabled, error) {
+    const title = source === "usda" ? "USDA FoodData Central" : "Open Food Facts";
+    if (!enabled) return `<div class="nf-match"><h4>${title}</h4><p class="meta">Not set up: add a USDA API key in Settings → Connections.</p></div>`;
+    if (error) return `<div class="nf-match"><h4>${title}</h4><p class="result bad">${esc(error)}</p></div>`;
+    if (!m) return `<div class="nf-match"><h4>${title}</h4><p class="meta">No match for this barcode.</p></div>`;
+    const rows = (m.nutrition?.nutrients ?? []).map((n) => `
+      <tr><td>${esc(n.name)}</td><td>${n.amount ?? ""}${esc(n.unit ?? "")}</td><td>${n.dailyValue != null ? `${n.dailyValue}%` : ""}</td></tr>`).join("");
+    return `
+      <div class="nf-match">
+        <h4>${title}</h4>
+        <div class="nf-matched">${esc(m.matchedName)}${m.brand ? ` <span class="meta">· ${esc(m.brand)}</span>` : ""}</div>
+        <div class="meta">Barcode ${esc(m.barcode)} · <a href="${esc(m.url)}" target="_blank" rel="noopener" style="color:var(--azure)">View source ↗</a></div>
+        ${m.nutrition ? `
+          <div class="meta" style="margin-top:8px">Serving: ${esc(m.nutrition.servingSize ?? "—")}
+            ${m.basis === "100g" ? ` · <span class="result bad">values per 100 g, not per serving</span>` : ""}</div>
+          <table class="nf-table"><tbody>${rows}</tbody></table>` : `<p class="meta">No nutrition facts.</p>`}
+        ${m.ingredients ? `<div class="nf-ingr"><b>Ingredients:</b> ${esc(m.ingredients)}</div>` : `<p class="meta">No ingredients.</p>`}
+        <button class="small" data-use="${source}">Use this</button>
+      </div>`;
+  }
+
+  list.addEventListener("click", async (e) => {
+    const row = e.target.closest(".nf-row");
+    if (!row) return;
+    const id = row.dataset.id;
+    const out = row.querySelector(".nf-result");
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    try {
+      if (btn.dataset.act === "lookup") {
+        btn.disabled = true; btn.textContent = "Looking up…";
+        const r = await api(`/api/nutrition/items/${id}/lookup`, { method: "POST" });
+        out.hidden = false;
+        out.innerHTML = r.note
+          ? `<p class="meta">${esc(r.note)}</p>`
+          : `<div class="meta" style="margin-bottom:8px">Tried barcodes: ${r.barcodes.map(esc).join(", ")}</div>
+             <div class="nf-compare">${matchCard(r.usda, "usda", r.usdaEnabled, r.errors.usda)}${matchCard(r.off, "off", true, r.errors.off)}</div>`;
+        btn.disabled = false; btn.textContent = "Look up";
+      } else if (btn.dataset.use) {
+        btn.disabled = true;
+        await api(`/api/nutrition/items/${id}/apply`, { method: "POST", body: { source: btn.dataset.use } });
+        await Promise.all([loadItems(), renderStatus()]);
+      } else if (btn.dataset.act === "clear") {
+        await api(`/api/nutrition/items/${id}/clear`, { method: "POST" });
+        await Promise.all([loadItems(), renderStatus()]);
+      }
+    } catch (x) {
+      btn.disabled = false;
+      if (btn.dataset.act === "lookup") btn.textContent = "Look up";
+      err.textContent = x.message;
+    }
+  });
+
+  document.getElementById("nfFilter").addEventListener("change", (e) => { state.filter = e.target.value; state.page = 1; loadItems(); });
+  document.getElementById("nfStore").addEventListener("change", (e) => { state.store = e.target.value; state.page = 1; loadItems(); });
+  let t;
+  document.getElementById("nfQ").addEventListener("input", (e) => {
+    clearTimeout(t);
+    t = setTimeout(() => { state.q = e.target.value.trim(); state.page = 1; loadItems(); }, 300);
+  });
+  document.getElementById("nfPrev").addEventListener("click", () => { state.page--; loadItems(); });
+  document.getElementById("nfNext").addEventListener("click", () => { state.page++; loadItems(); });
+
+  await Promise.all([renderStatus(), loadItems()]);
 }
 
 /* ---------- Settings ---------- */
