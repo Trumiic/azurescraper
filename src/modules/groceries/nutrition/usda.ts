@@ -5,7 +5,10 @@
  */
 import { config } from "../../../config.js";
 import { registerProvider, resolveValues } from "../../../core/connections.js";
-import { rateLimit } from "../../../core/ratelimit.js";
+import { defineLimit, rateLimit, RateLimitError, retryAfterMs, slowDown } from "../../../core/ratelimit.js";
+
+// USDA allows 1,000 requests/hour per key. Stay at 950 and spread them out.
+defineLimit("usda", { max: 950, windowMs: 60 * 60 * 1000, gapMs: 500, maxGapMs: 8000 });
 import { buildFacts, type NutritionMatch } from "./facts.js";
 import { sameBarcode } from "./upc.js";
 
@@ -30,11 +33,14 @@ export const usdaConfigured = () => Boolean(resolveValues("usda").apiKey);
 async function usdaGet<T>(path: string, params: Record<string, string | number>, key?: string, cancelled?: () => boolean): Promise<T> {
   const apiKey = key ?? resolveValues("usda").apiKey;
   if (!apiKey) throw new Error("USDA API key not set (Settings → Connections)");
-  await rateLimit("usda", 950, 60 * 60 * 1000, cancelled); // stay under 1,000/hour
+  await rateLimit("usda", cancelled);
   const qs = new URLSearchParams({ api_key: apiKey, ...Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)])) });
   const res = await fetch(`${config.usda.baseUrl}${path}?${qs}`, { headers: { Accept: "application/json" } });
   if (res.status === 404) return null as T;
-  if (res.status === 429) throw new Error("USDA hourly limit reached; try again later");
+  if (res.status === 429) {
+    slowDown("usda");
+    throw new RateLimitError("USDA hourly limit reached", retryAfterMs(res.headers.get("retry-after"), 10 * 60_000));
+  }
   if (res.status === 403) throw new Error("USDA rejected the API key (403)");
   if (!res.ok) throw new Error(`USDA ${path} failed (${res.status})`);
   return (await res.json()) as T;

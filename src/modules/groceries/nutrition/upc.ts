@@ -21,30 +21,56 @@ export function isValidGtin(code: string): boolean {
   return /^\d{8,14}$/.test(code) && gs1CheckDigit(code.slice(0, -1)) === Number(code.slice(-1));
 }
 
+export type SkipReason = "produce" | "variable-weight" | "in-store" | "no-upc";
+
+export const SKIP_LABEL: Record<SkipReason, string> = {
+  "produce": "produce code (PLU), no retail barcode",
+  "variable-weight": "packed in store by weight (meat, deli, bakery), no retail barcode",
+  "in-store": "store-internal code, no retail barcode",
+  "no-upc": "no barcode saved for this item",
+};
+
 /**
- * Barcodes to try for a stored item_upc, best guess first.
- * Returns [] for things that can't be retail barcodes (e.g. produce PLUs).
+ * Barcodes to try for a stored item_upc (best guess first), or why there are none.
+ *
+ * UPC-A number system (first digit) matters:
+ *   2 = variable-weight items priced in store (meat, deli, cheese counter)
+ *   4 = store-internal codes (loyalty, coupons, in-store items)
+ * Neither exists in USDA or Open Food Facts, so they are skipped.
  */
-export function barcodeCandidates(raw: string | null | undefined, store?: string): string[] {
+export function classifyBarcode(
+  raw: string | null | undefined,
+  store?: string,
+): { barcodes: string[]; skip?: SkipReason } {
   const digits = (raw ?? "").replace(/\D/g, "");
-  if (!digits) return [];
+  if (!digits) return { barcodes: [], skip: "no-upc" };
   const out: string[] = [];
   const add = (c: string) => { if (!out.includes(c)) out.push(c); };
 
+  let upcA: string | undefined;
   if (store === "kroger" && digits.length === 13 && digits.startsWith("00")) {
     const body = digits.slice(2);                   // 11 digits, no check digit
-    if (/^0{6,}/.test(body)) return [];             // PLU / random-weight codes, e.g. bananas
-    const upcA = body + gs1CheckDigit(body);        // 12-digit UPC-A
+    if (/^0{6,}/.test(body)) return { barcodes: [], skip: "produce" };
+    upcA = body + gs1CheckDigit(body);              // 12-digit UPC-A
+  } else if (digits.length === 12 && isValidGtin(digits)) {
+    upcA = digits;
+  } else if (digits.length === 13 && digits.startsWith("0") && isValidGtin(digits)) {
+    upcA = digits.slice(1);
+  }
+
+  if (upcA) {
+    if (upcA[0] === "2") return { barcodes: [], skip: "variable-weight" };
+    if (upcA[0] === "4") return { barcodes: [], skip: "in-store" };
     add(upcA);
     add("0" + upcA);                                // same code as EAN-13
+  } else if (isValidGtin(digits)) {
+    add(digits);                                    // EAN-13 / GTIN-14 from outside the US
   }
-  // Already a complete barcode (other stores, or Kroger ids that happen to be valid)
-  if (isValidGtin(digits)) {
-    add(digits);
-    if (digits.length === 13 && digits.startsWith("0")) add(digits.slice(1));
-    if (digits.length === 12) add("0" + digits);
-  }
-  return out;
+  return out.length ? { barcodes: out } : { barcodes: [], skip: "no-upc" };
+}
+
+export function barcodeCandidates(raw: string | null | undefined, store?: string): string[] {
+  return classifyBarcode(raw, store).barcodes;
 }
 
 /** Compare barcodes ignoring leading zeros (USDA stores 12 or 14 digit forms). */

@@ -12,7 +12,8 @@ import { startJob } from "../../../core/jobs.js";
 import type { ScraperModule } from "../../../core/types.js";
 import type { NutritionMatch } from "./facts.js";
 import { offLookup } from "./off.js";
-import { barcodeCandidates } from "./upc.js";
+import { classifyBarcode, SKIP_LABEL } from "./upc.js";
+import { RateLimitError, sleep } from "../../../core/ratelimit.js";
 import { usdaConfigured, usdaLookup } from "./usda.js";
 
 export const NUTRITION_SCOPE = "groceries/nutrition";
@@ -145,6 +146,9 @@ export async function clearNutrition(id: string) {
 
 /* ---------- Manual lookup (side by side) ---------- */
 
+const friendly = (e: Error) =>
+  e instanceof RateLimitError ? `${e.message}. Try again in about ${Math.ceil(e.retryAfterMs / 1000)} s.` : e.message;
+
 export interface LookupResult {
   itemId: string;
   name: string;
@@ -161,20 +165,20 @@ const cache = new Map<string, { at: number; result: LookupResult }>();
 
 export async function lookupItem(id: string): Promise<LookupResult> {
   const item = await getItem(id);
-  const barcodes = barcodeCandidates(item.item_upc, item.store);
+  const { barcodes, skip } = classifyBarcode(item.item_upc, item.store);
   const result: LookupResult = {
     itemId: id, name: item.item_name, barcodes, usda: null, off: null,
     usdaEnabled: usdaConfigured(), errors: {},
   };
   if (!barcodes.length) {
-    result.note = "No retail barcode for this item (e.g. produce or meat sold by weight).";
+    result.note = `Skipped: ${SKIP_LABEL[skip ?? "no-upc"]}. USDA and Open Food Facts only list packaged products with retail barcodes.`;
     await recordLookup(id, "nobarcode");
   } else {
     await Promise.all([
       result.usdaEnabled
-        ? usdaLookup(barcodes).then((m) => { result.usda = m; }, (e: Error) => { result.errors.usda = e.message; })
+        ? usdaLookup(barcodes).then((m) => { result.usda = m; }, (e: Error) => { result.errors.usda = friendly(e); })
         : Promise.resolve(),
-      offLookup(barcodes).then((m) => { result.off = m; }, (e: Error) => { result.errors.off = e.message; }),
+      offLookup(barcodes).then((m) => { result.off = m; }, (e: Error) => { result.errors.off = friendly(e); }),
     ]);
     if (!result.usda && !result.off && !result.errors.usda && !result.errors.off) {
       await recordLookup(id, "notfound");
@@ -225,34 +229,51 @@ export function startNutritionFill(store?: string) {
     }
 
     let consecutiveErrors = 0;
+    const skipped: Record<string, number> = {};
     for (const it of items) {
       if (ctx.cancelled) break;
-      const barcodes = barcodeCandidates(it.item_upc, it.store);
+      const { barcodes, skip } = classifyBarcode(it.item_upc, it.store);
       if (!barcodes.length) {
         await recordLookup(it.id, "nobarcode");
-        ctx.stat("noBarcode");
+        ctx.stat(skip === "variable-weight" ? "variableWeight" : skip === "produce" ? "produce" : "noBarcode");
+        skipped[skip ?? "no-upc"] = (skipped[skip ?? "no-upc"] ?? 0) + 1;
         ctx.tick();
         continue;
       }
-      try {
-        let match: NutritionMatch | null = null;
-        if (useUsda) match = await usdaLookup(barcodes, () => ctx.cancelled);
-        if (!match?.nutrition) match = (await offLookup(barcodes, () => ctx.cancelled)) ?? match;
-        if (match) {
-          await applyMatch(it.id, match);
-          ctx.stat(match.source === "usda" ? "fromUsda" : "fromOff");
-        } else {
-          await recordLookup(it.id, "notfound");
-          ctx.stat("notFound");
+
+      // Rate limits pause the job and retry the same item; they are not errors.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          let match: NutritionMatch | null = null;
+          if (useUsda) match = await usdaLookup(barcodes, () => ctx.cancelled);
+          if (!match?.nutrition) match = (await offLookup(barcodes, () => ctx.cancelled)) ?? match;
+          if (match) {
+            await applyMatch(it.id, match);
+            ctx.stat(match.source === "usda" ? "fromUsda" : "fromOff");
+          } else {
+            await recordLookup(it.id, "notfound");
+            ctx.stat("notFound");
+          }
+          consecutiveErrors = 0;
+          break;
+        } catch (e) {
+          if (ctx.cancelled) break;
+          if (e instanceof RateLimitError && attempt <= 5) {
+            ctx.stat("pauses");
+            ctx.log(`${e.message}; pausing ${Math.ceil(e.retryAfterMs / 1000)} s, then retrying "${it.item_name}"`);
+            try { await sleep(e.retryAfterMs, () => ctx.cancelled); } catch { break; }
+            continue;
+          }
+          ctx.stat("errors");
+          ctx.log(`${it.item_name}: ${(e as Error).message}`);
+          if (++consecutiveErrors >= 5) throw new Error("Stopped after 5 errors in a row; check your connections");
+          break;
         }
-        consecutiveErrors = 0;
-      } catch (e) {
-        if (ctx.cancelled) break;
-        ctx.stat("errors");
-        ctx.log(`${it.item_name}: ${(e as Error).message}`);
-        if (++consecutiveErrors >= 5) throw new Error("Stopped after 5 errors in a row; check your connections");
       }
       ctx.tick();
+    }
+    for (const [k, n] of Object.entries(skipped)) {
+      ctx.log(`Skipped ${n}: ${SKIP_LABEL[k as keyof typeof SKIP_LABEL]}`);
     }
     return ctx.cancelled ? "Nutrition fill cancelled" : "Nutrition fill finished";
   });

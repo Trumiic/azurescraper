@@ -270,6 +270,7 @@ const STAT_LABEL = {
   found: "found", new: "new", updated: "updated", priced: "priced", unpriced: "no price",
   pricePoints: "price points", calls: "API calls", errors: "errors", removed: "removed",
   fromUsda: "from USDA", fromOff: "from Open Food Facts", notFound: "not found", noBarcode: "no barcode",
+  variableWeight: "packed by weight (skipped)", produce: "produce (skipped)", pauses: "rate-limit pauses",
 };
 const JOB_TITLE = { crawl: "Crawl", prices: "Price update", fill: "Nutrition fill" };
 
@@ -506,7 +507,7 @@ async function renderNutrition() {
       const src = it.source?.source === "usda" ? "USDA" : it.source?.source === "off" ? "Open Food Facts" : "store";
       return `<span class="pill ready">✓ ${esc(src)}</span>`;
     }
-    if (it.lastLookup?.result === "nobarcode") return `<span class="pill planned">No barcode</span>`;
+    if (it.lastLookup?.result === "nobarcode") return `<span class="pill planned" title="Produce or items packed in store by weight have no retail barcode">No barcode</span>`;
     if (it.lastLookup?.result === "notfound") {
       return `<span class="pill planned">Not found ${esc(new Date(it.lastLookup.at).toLocaleDateString())}</span>`;
     }

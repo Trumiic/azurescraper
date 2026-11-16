@@ -4,7 +4,10 @@
  * and share any database you publish that is derived from it under ODbL.
  */
 import { config } from "../../../config.js";
-import { rateLimit } from "../../../core/ratelimit.js";
+import { defineLimit, rateLimit, RateLimitError, retryAfterMs, slowDown } from "../../../core/ratelimit.js";
+
+// OFF allows 100 product reads/minute. Spread calls ~1 s apart (60/min) for headroom.
+defineLimit("off", { max: 60, windowMs: 60_000, gapMs: 1000, maxGapMs: 8000 });
 import { buildFacts, type NutritionMatch } from "./facts.js";
 
 const USER_AGENT = "AzureScraper/0.5 (self-hosted grocery app)";
@@ -63,18 +66,27 @@ export function mapOffProduct(p: OffProduct, barcode: string): NutritionMatch {
   };
 }
 
+/**
+ * One request per item: OFF stores US products under the 13-digit EAN form
+ * (e.g. 0011110815330), so asking for both the 12- and 13-digit forms only doubles calls.
+ */
 export async function offLookup(barcodes: string[], cancelled?: () => boolean): Promise<NutritionMatch | null> {
   const fields = "code,product_name,product_name_en,brands,ingredients_text,ingredients_text_en,serving_size,nutriments";
-  for (const code of barcodes.slice(0, 2)) {
-    await rateLimit("off", 90, 60 * 1000, cancelled); // OFF asks for <= 100 product reads/minute
-    const res = await fetch(`${config.off.baseUrl}/api/v2/product/${code}.json?fields=${fields}`, {
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-    });
-    if (res.status === 404) continue;
-    if (res.status === 429) throw new Error("Open Food Facts rate limit reached; try again shortly");
-    if (!res.ok) throw new Error(`Open Food Facts failed (${res.status})`);
-    const body = (await res.json()) as { status?: number; product?: OffProduct };
-    if (body.status === 1 && body.product) return mapOffProduct(body.product, code);
+  const code = barcodes.find((b) => b.length === 13) ?? barcodes[0];
+  if (!code) return null;
+  await rateLimit("off", cancelled);
+  const res = await fetch(`${config.off.baseUrl}/api/v2/product/${code}.json?fields=${fields}`, {
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+  });
+  if (res.status === 429) {
+    const gap = slowDown("off");
+    throw new RateLimitError(
+      `Open Food Facts asked us to slow down (now ${Math.round(gap / 100) / 10}s between calls)`,
+      retryAfterMs(res.headers.get("retry-after"), 60_000),
+    );
   }
-  return null;
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Open Food Facts failed (${res.status})`);
+  const body = (await res.json()) as { status?: number; product?: OffProduct };
+  return body.status === 1 && body.product ? mapOffProduct(body.product, code) : null;
 }
