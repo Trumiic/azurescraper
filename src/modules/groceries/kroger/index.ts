@@ -190,6 +190,7 @@ export const kroger: ScraperModule = {
   status: () => (krogerConfigured() ? "ready" : "needs-config"),
 
   crawl: { pageSize: 50, maxPages: 5, dailyCalls: krogerUsage },
+  webExtension: "kroger-web",
 
   async findLocations(zip: string): Promise<StoreLocation[]> {
     const res = await krogerGet<{ data: KrogerLocation[] }>("/locations", {

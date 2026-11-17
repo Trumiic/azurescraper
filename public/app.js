@@ -80,12 +80,13 @@ async function renderCategory(catId) {
           </div>
           <div class="tile-foot"><span class="pill ${m.status}">${STATUS_LABEL[m.status]}</span></div>
         </${open ? "a" : "div"}>`;
-      }).join("")}
+      }).join("") || `<div class="panel empty-cat"><h2>Coming soon</h2>
+        <p class="meta">This category is a placeholder. Its scrapers will be added later.</p></div>`}
     </div>`;
 }
 
 /* ---------- Module page ---------- */
-async function renderModule(catId, modId) {
+async function renderModule(catId, modId, tab) {
   const [cat, mod, db] = await Promise.all([
     api(`/api/categories/${catId}`),
     api(`/api/categories/${catId}/modules/${modId}`),
@@ -97,10 +98,12 @@ async function renderModule(catId, modId) {
   const locKey = `azs.${modId}.location`;
 
   if (mod.kind === "enricher" && mod.status === "ready") return renderNutrition();
+  if (mod.webExtension && tab === "scraper") return renderScraperTab(cat, mod);
 
   if (mod.status === "needs-config") {
     view.innerHTML = `
       <h1>${esc(mod.name)} <span class="pill needs-config">${STATUS_LABEL[mod.status]}</span></h1>
+      ${moduleTabs(catId, mod, "api")}
       <p class="sub">${esc(mod.description)}</p>
       <div class="panel">
         <h2>Setup needed</h2>
@@ -114,6 +117,7 @@ async function renderModule(catId, modId) {
 
   view.innerHTML = `
     <h1>${esc(mod.name)} <span class="pill ${mod.status}">${STATUS_LABEL[mod.status]}</span></h1>
+    ${moduleTabs(catId, mod, "api")}
     <p class="sub">${esc(mod.description)} · <span class="meta">${esc(mod.method)}</span></p>
 
     ${mod.canFindLocations ? `
@@ -288,7 +292,7 @@ function jobBox(job) {
       </div>
       <div class="bar"><div style="width:${pct}%"></div></div>
       <div class="chips">${statChips(job.stats)}</div>
-      ${job.message ? `<div class="result ${job.status === "failed" ? "bad" : "ok"}">${esc(job.message)}</div>` : ""}
+      ${job.message ? `<div class="result ${job.status === "failed" || /^Stopped early/.test(job.message) ? "bad" : "ok"}">${esc(job.message)}</div>` : ""}
       <pre class="log">${esc(job.log.slice(-12).join("\n"))}</pre>
     </div>`;
 }
@@ -310,7 +314,8 @@ function statChips(stats = {}) {
 function lastRunLine(run) {
   if (!run) return `<span class="meta">Never run</span>`;
   const when = run.finishedAt ? new Date(run.finishedAt).toLocaleString() : "";
-  const cls = run.status === "failed" ? "bad" : run.status === "done" ? "ok" : "";
+  const warn = run.status === "failed" || /^Stopped early/.test(run.message ?? "");
+  const cls = warn ? "bad" : run.status === "done" ? "ok" : "";
   return `<span class="meta">Last run ${esc(when)} · </span><span class="result ${cls}">${esc(run.message ?? run.status)}</span>
     <div class="chips">${statChips(run.stats)}</div>`;
 }
@@ -607,6 +612,237 @@ async function renderNutrition() {
   await Promise.all([renderStatus(), loadItems()]);
 }
 
+/* ---------- Store tabs: API | Scraper ---------- */
+function moduleTabs(catId, mod, active) {
+  if (!mod.webExtension) return "";
+  return `
+    <nav class="tabs">
+      <a href="#/c/${catId}/${mod.id}" class="${active === "api" ? "active" : ""}">API</a>
+      <a href="#/c/${catId}/${mod.id}/scraper" class="${active === "scraper" ? "active" : ""}">Scraper</a>
+    </nav>`;
+}
+
+const RESULT_LABEL = {
+  saved: ["ready", "Saved"], preview: ["planned", "Dry run"], nolabel: ["planned", "No label on page"],
+  notfound: ["needs-config", "Not found"], interrupted: ["needs-config", "Interrupted"], error: ["needs-config", "Error"],
+};
+STAT_LABEL.saved = "saved";
+STAT_LABEL.noLabel = "no label on page";
+STAT_LABEL.previews = "dry runs";
+STAT_LABEL.interruptions = "interruptions";
+JOB_TITLE.scrape = "Scraper";
+
+function fmtWait(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s} s`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m} min` : `${Math.round(m / 6) / 10} h`;
+}
+
+async function renderScraperTab(cat, mod) {
+  const extId = mod.webExtension;
+  const base = `/api/scraper/${extId}`;
+  const locKey = `azs.${mod.id}.location`;
+  const savedLoc = (() => { try { return JSON.parse(store.get(locKey) || "null"); } catch { return null; } })();
+
+  view.innerHTML = `
+    <h1>${esc(mod.name)} <span class="pill ready">Scraper</span></h1>
+    ${moduleTabs(cat.id, mod, "scraper")}
+    <p class="sub">Reads nutrition facts, ingredients and allergens from ${esc(mod.name)}'s product pages using a real browser
+      (FlareSolverr). Prices stay on the API tab.</p>
+    <div id="scStatus"></div>
+
+    <div class="panel">
+      <h2>Add by item</h2>
+      <p class="meta">Paste a product URL, the product ID shown on the page ("UPC: 000…"), or a 12-digit barcode.
+        Manual items go to the front of the queue.</p>
+      <form id="scAdd" class="row" style="margin-top:10px">
+        <input id="scInput" class="grow" placeholder="https://www.kroger.com/p/…/0001111040101  or  0001111040101" />
+        <label class="check"><input type="checkbox" id="scDry" /> Dry run (preview, don't save)</label>
+        <button type="submit">Queue</button>
+      </form>
+      <div id="scAddMsg" class="meta" style="margin-top:8px">${savedLoc
+        ? `New items are created through the API at your picked store: ${esc(savedLoc.label)}.`
+        : "Tip: pick a store on the API tab so new items also get a price from the API."}</div>
+      <div id="scPreview"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Fill nutrition & ingredients <span class="meta">(saved ${esc(mod.name)} items)</span></h2>
+      <div id="scCounts" class="meta"></div>
+      <div class="row" style="margin-top:12px">
+        <label class="meta">Batch size
+          <select id="scLimit" style="min-width:auto;margin-left:6px">
+            ${[10, 25, 50, 100, 200, 400].map((n) => `<option ${n === 50 ? "selected" : ""}>${n}</option>`).join("")}
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="scReplace" checked /> Replace USDA / Open Food Facts data with ${esc(mod.name)}'s label</label>
+        <button id="scFill">Add batch to queue</button>
+      </div>
+      <div id="scFillMsg" class="meta" style="margin-top:8px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Recent results</h2>
+      <div id="scRecent"></div>
+    </div>
+    <div id="scError" class="error"></div>`;
+
+  const err = document.getElementById("scError");
+  const statusEl = document.getElementById("scStatus");
+  let last = null;
+
+  function statusHtml(s) {
+    const p = s.pacer;
+    const running = s.current?.status === "running" ? s.current : null;
+    const waitMs = p.nextAt - Date.now();
+    const cooldown = p.cooldownUntil ? `
+      <div class="cooldown">
+        <b>Paused after an interruption.</b> ${esc(p.cooldownReason ?? "")}<br>
+        No pages will be loaded until <b>${esc(new Date(p.cooldownUntil).toLocaleString())}</b>
+        (${fmtWait(p.cooldownUntil - Date.now())} from now). ${s.queueLength ? `${s.queueLength} items are still queued.` : ""}
+        <div class="actions"><button class="ghost small" id="scClearCooldown">Resume now (clear pause)</button>
+          <span class="meta">Only if you know the cause is fixed.</span></div>
+      </div>` : "";
+    return `
+      ${cooldown}
+      <div class="panel">
+        <h2>Status</h2>
+        <div class="bulk-grid">
+          <div class="bulk-card">
+            <h3>Browser: ${esc(s.runner.name)} <span class="pill ${s.runner.ready ? "ready" : "needs-config"}">${s.runner.ready ? "Ready" : "Not set up"}</span></h3>
+            <p class="meta">${s.runner.ready ? "One browser session per run, closed when the run ends."
+              : `Add your FlareSolverr URL in <a href="#/settings/connections" style="color:var(--azure)">Settings → Connections</a>.`}</p>
+            ${s.dbConfigured ? "" : `<p class="result bad">PostgreSQL not configured: only dry runs work.</p>`}
+          </div>
+          <div class="bulk-card">
+            <h3>Pace</h3>
+            <p class="meta">Max <b>${p.maxPerHour}</b> pages/hour · random ${p.gapSeconds[0]}–${p.gapSeconds[1]} s between pages ·
+              ${p.cooldownHours} h pause after any interruption.</p>
+            <p class="meta">Last hour: <b>${p.lastHour}</b> / ${p.maxPerHour} ·
+              ${p.cooldownUntil ? "paused" : waitMs > 1000 ? `next page allowed in <b data-countdown="${p.nextAt}">${fmtWait(waitMs)}</b>` : "ready now"}</p>
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <span class="meta">Queue: <b>${s.queueLength}</b>${s.queuedManual ? ` (${s.queuedManual} manual)` : ""}</span>
+          ${s.queueLength && !running ? `<span class="meta">· not running${p.cooldownUntil ? " (paused)" : ""}</span>
+            <button class="small" id="scResume" ${p.cooldownUntil ? "disabled" : ""}>Run queue</button>` : ""}
+          ${s.queueLength ? `<button class="ghost small" id="scClearFill">Clear batch items</button>
+            <button class="ghost small" id="scClearAll">Clear queue</button>` : ""}
+        </div>
+        ${s.queue.length ? `<div class="chips">${s.queue.slice(0, 12).map((q) =>
+          `<span class="chip">${q.kind === "manual" ? "★ " : ""}${esc((q.name ?? q.productId).slice(0, 40))}${q.dryRun ? " (dry run)" : ""}</span>`).join("")}
+          ${s.queueLength > 12 ? `<span class="chip">+${s.queueLength - 12} more</span>` : ""}</div>` : ""}
+        <div class="last">${lastRunLine(s.last?.scrape)}${scheduleLine(s.schedule, "scrape")}</div>
+        ${jobBox(s.current)}
+      </div>`;
+  }
+
+  function recentHtml(list) {
+    if (!list.length) return `<div class="empty">Nothing scraped yet.</div>`;
+    return `<table class="nf-table recent"><tbody>${list.map((r) => {
+      const [cls, label] = RESULT_LABEL[r.result] ?? ["planned", r.result];
+      const detail = r.result === "saved" || r.result === "preview"
+        ? `${r.nutrients} nutrients · ingredients ${r.ingredients ? "✓" : "–"} · allergens ${r.allergens ? "✓" : "–"}`
+        : esc(r.message ?? "");
+      return `<tr>
+        <td class="meta">${esc(new Date(r.at).toLocaleString())}</td>
+        <td><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name ?? r.productId)}</a>${r.kind === "manual" ? " <span class='meta'>★</span>" : ""}</td>
+        <td><span class="pill ${cls}">${label}</span></td>
+        <td class="meta">${detail}</td>
+        <td>${r.result === "preview" ? `<button class="ghost small" data-preview="${esc(r.productId)}">View</button>` : ""}</td>
+      </tr>`;
+    }).join("")}</tbody></table>`;
+  }
+
+  async function refresh() {
+    if (!statusEl.isConnected) return;
+    try {
+      const s = await api(base);
+      last = s;
+      statusEl.innerHTML = statusHtml(s);
+      const c = s.counts;
+      document.getElementById("scCounts").innerHTML = c
+        ? `<b>${c.total.toLocaleString()}</b> items · <b>${c.missing_nf.toLocaleString()}</b> missing nutrition ·
+           <b>${c.missing_ingredients.toLocaleString()}</b> missing ingredients · ${c.from_other.toLocaleString()} from USDA/Open Food Facts ·
+           ${c.from_site.toLocaleString()} from ${esc(mod.name)}'s site · ${c.no_label.toLocaleString()} ${c.no_label === 1 ? "page" : "pages"} without a label.
+           At ${s.pacer.maxPerHour}/hour, 50 items take about an hour.`
+        : "Add PostgreSQL to fill saved items.";
+      document.getElementById("scRecent").innerHTML = recentHtml(s.recent);
+      bindStatus(s);
+    } catch (e) { err.textContent = e.message; }
+    clearTimeout(statusEl._poll);
+    statusEl._poll = setTimeout(refresh, last?.current?.status === "running" ? 2000 : 10000);
+  }
+
+  function bindStatus(s) {
+    const act = (fn) => async () => { err.textContent = ""; try { await fn(); await refresh(); } catch (e) { err.textContent = e.message; } };
+    document.getElementById("scClearCooldown")?.addEventListener("click", act(() => api(`${base}/cooldown/clear`, { method: "POST" })));
+    document.getElementById("scResume")?.addEventListener("click", act(() => api(`${base}/run`, { method: "POST" })));
+    document.getElementById("scClearFill")?.addEventListener("click", act(() => api(`${base}/queue/clear`, { method: "POST", body: { kind: "fill" } })));
+    document.getElementById("scClearAll")?.addEventListener("click", act(() => api(`${base}/queue/clear`, { method: "POST", body: {} })));
+    statusEl.querySelector("[data-cancel]")?.addEventListener("click", act((e) => api(`/api/jobs/${s.current.id}/cancel`, { method: "POST" })));
+  }
+
+  // live countdown between polls
+  const ticker = setInterval(() => {
+    if (!statusEl.isConnected) return clearInterval(ticker);
+    statusEl.querySelectorAll("[data-countdown]").forEach((el) => { el.textContent = fmtWait(Number(el.dataset.countdown) - Date.now()); });
+  }, 1000);
+
+  document.getElementById("scAdd").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    err.textContent = "";
+    const msg = document.getElementById("scAddMsg");
+    const dryRun = document.getElementById("scDry").checked;
+    try {
+      const r = await api(`${base}/add`, { method: "POST", body: {
+        input: document.getElementById("scInput").value, dryRun, locationId: savedLoc?.id } });
+      msg.className = "result ok";
+      msg.textContent = `Queued ${r.productId} (position ${r.position})${dryRun ? " as a dry run" : ""}.${r.note ? ` ${r.note}.` : ""}`;
+      document.getElementById("scInput").value = "";
+      await refresh();
+    } catch (x) { msg.className = "result bad"; msg.textContent = x.message; }
+  });
+
+  document.getElementById("scFill").addEventListener("click", async () => {
+    err.textContent = "";
+    const msg = document.getElementById("scFillMsg");
+    try {
+      const r = await api(`${base}/fill`, { method: "POST", body: {
+        limit: Number(document.getElementById("scLimit").value),
+        replaceOther: document.getElementById("scReplace").checked } });
+      msg.className = r.added ? "result ok" : "meta";
+      msg.textContent = r.added ? `Added ${r.added} items to the queue (${r.queueLength} queued).` : "Nothing to add: every item is filled or was checked recently.";
+      await refresh();
+    } catch (x) { msg.className = "result bad"; msg.textContent = x.message; }
+  });
+
+  document.getElementById("scRecent").addEventListener("click", async (e) => {
+    const id = e.target.closest("[data-preview]")?.dataset.preview;
+    if (!id) return;
+    try {
+      const p = await api(`${base}/preview/${encodeURIComponent(id)}`);
+      const prod = p.data.product ?? {};
+      const rows = (prod.nutrition?.nutrients ?? []).map((n) =>
+        `<tr><td>${esc(n.name)}</td><td>${n.amount ?? ""}${esc(n.unit ?? "")}</td><td>${n.dailyValue != null ? `${n.dailyValue}%` : ""}</td></tr>`).join("");
+      document.getElementById("scPreview").innerHTML = `
+        <div class="nf-match" style="margin-top:12px">
+          <h4>Dry run: ${esc(prod.name ?? id)}</h4>
+          <div class="meta"><a href="${esc(p.url)}" target="_blank" rel="noopener" style="color:var(--azure)">Open page ↗</a>
+            · Serving: ${esc(prod.nutrition?.servingSize ?? "—")} · Servings: ${esc(prod.nutrition?.servingsPerPackage ?? "—")}</div>
+          ${rows ? `<table class="nf-table"><tbody>${rows}</tbody></table>` : `<p class="meta">No nutrition label found.</p>`}
+          <div class="nf-ingr"><b>Ingredients:</b> ${esc(prod.ingredients ?? "—")}</div>
+          <div class="nf-ingr"><b>Allergens:</b> ${esc(p.data.allergens ?? "—")}</div>
+          ${(p.data.warnings ?? []).map((w) => `<p class="result bad">${esc(w)}</p>`).join("")}
+        </div>`;
+      document.getElementById("scPreview").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (x) { err.textContent = x.message; }
+  });
+
+  await refresh();
+}
+
 /* ---------- Settings ---------- */
 const SETTINGS_PAGES = [
   { id: "general", label: "General", wip: true },
@@ -847,7 +1083,7 @@ async function route() {
   document.getElementById("settingsBtn").classList.toggle("active", parts[0] === "settings");
   try {
     if (parts[0] === "settings") await renderSettings(parts[1] || "connections");
-    else if (parts[0] === "c" && parts[2]) await renderModule(parts[1], parts[2]);
+    else if (parts[0] === "c" && parts[2]) await renderModule(parts[1], parts[2], parts[3]);
     else if (parts[0] === "c" && parts[1]) await renderCategory(parts[1]);
     else await renderHome();
   } catch (e) {

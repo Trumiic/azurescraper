@@ -26,6 +26,11 @@ import {
   applyLookup, clearNutrition, listNutritionItems, lookupItem, NUTRITION_SCOPE, nutritionCounts, startNutritionFill,
 } from "./modules/groceries/nutrition/index.js";
 import { usdaConfigured } from "./modules/groceries/nutrition/usda.js";
+import { getExtension, runners } from "./scraper/engine.js";
+import { clearCooldown, pacerStatus } from "./scraper/pacer.js";
+import {
+  clearQueue, enqueueFill, enqueueManual, getPreview, runQueue, scrapeCounts, workerStatus,
+} from "./scraper/grocery-worker.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
@@ -46,6 +51,7 @@ const moduleInfo = (m: ScraperModule) => ({
   canSearch: Boolean(m.searchProducts),
   canSave: Boolean(m.getProductDetails),
   kind: m.kind ?? "store",
+  webExtension: m.webExtension ?? null,
 });
 
 const categoryInfo = (c: Category) => ({
@@ -304,6 +310,79 @@ app.post<{ Params: { id: string } }>("/api/nutrition/items/:id/clear", async (re
 app.post<{ Body: { store?: string } }>("/api/nutrition/jobs/fill", async (req, reply) => {
   requireDb();
   return reply.code(202).send(startNutritionFill(req.body?.store || undefined));
+});
+
+/* ---------- Website scraper (per extension, e.g. kroger-web) ---------- */
+
+function requireExtension(id: string) {
+  const ext = getExtension(id);
+  if (!ext) throw new HttpError(404, "Scraper extension not found");
+  return ext;
+}
+const apiModuleFor = (store: string) =>
+  categories.flatMap((c) => c.modules).find((m) => m.id === store && (m.kind ?? "store") === "store");
+
+app.get<{ Params: { ext: string } }>("/api/scraper/:ext", async (req) => {
+  const ext = requireExtension(req.params.ext);
+  const runner = runners[ext.runner];
+  const scope = `groceries/${ext.id}`;
+  return {
+    id: ext.id,
+    name: ext.name,
+    store: ext.store,
+    runner: { id: runner.id, name: runner.name, ready: runner.ready() },
+    pacer: pacerStatus(ext.id, ext.pacing),
+    counts: await scrapeCounts(ext.store).catch(() => null),
+    dbConfigured: dbConfigured(),
+    apiReady: apiModuleFor(ext.store)?.status() === "ready",
+    ...workerStatus(ext),
+    ...jobsFor(scope),
+    schedule: scheduleFor(scope),
+  };
+});
+
+app.post<{ Params: { ext: string }; Body: { input?: string; dryRun?: boolean; locationId?: string } }>(
+  "/api/scraper/:ext/add",
+  async (req, reply) => {
+    const ext = requireExtension(req.params.ext);
+    const input = (req.body?.input ?? "").trim();
+    if (!input) throw new HttpError(400, "Enter a product URL, product ID, or UPC");
+    const r = await enqueueManual(ext, input, {
+      dryRun: Boolean(req.body?.dryRun),
+      apiModule: apiModuleFor(ext.store),
+      locationId: req.body?.locationId || undefined,
+    });
+    return reply.code(202).send(r);
+  },
+);
+
+app.post<{ Params: { ext: string }; Body: { limit?: number; replaceOther?: boolean } }>(
+  "/api/scraper/:ext/fill",
+  async (req, reply) => {
+    const ext = requireExtension(req.params.ext);
+    const r = await enqueueFill(ext, { limit: Number(req.body?.limit ?? 50), replaceOther: Boolean(req.body?.replaceOther) });
+    return reply.code(202).send(r);
+  },
+);
+
+app.post<{ Params: { ext: string }; Body: { kind?: "fill" | "manual" } }>("/api/scraper/:ext/queue/clear", async (req) => {
+  return clearQueue(requireExtension(req.params.ext), req.body?.kind);
+});
+
+app.post<{ Params: { ext: string } }>("/api/scraper/:ext/run", async (req, reply) => {
+  return reply.code(202).send(runQueue(requireExtension(req.params.ext)));
+});
+
+app.post<{ Params: { ext: string } }>("/api/scraper/:ext/cooldown/clear", async (req) => {
+  const ext = requireExtension(req.params.ext);
+  clearCooldown(ext.id);
+  return { ok: true };
+});
+
+app.get<{ Params: { ext: string; id: string } }>("/api/scraper/:ext/preview/:id", async (req) => {
+  const p = getPreview(requireExtension(req.params.ext), req.params.id);
+  if (!p) throw new HttpError(404, "No preview for that product (run a dry run first)");
+  return p;
 });
 
 /* ---------- Settings -> Connections ---------- */

@@ -2,6 +2,11 @@ import type { Category } from "./types.js";
 import { kroger } from "../modules/groceries/kroger/index.js";
 import { walmart, meijer, target, aldi } from "../modules/groceries/planned.js";
 import { nutrition } from "../modules/groceries/nutrition/index.js";
+import { krogerWeb } from "../modules/groceries/kroger/web.js";
+import { registerExtension } from "../scraper/engine.js";
+
+// Website scraper extensions (see src/scraper)
+registerExtension(krogerWeb);
 
 /**
  * Every category tile on the home page, and the modules inside it.
@@ -14,6 +19,13 @@ export const categories: Category[] = [
     description: "Prices and product data from grocery stores",
     icon: "🛒",
     modules: [kroger, walmart, meijer, target, aldi, nutrition],
+  },
+  {
+    id: "video-games",
+    name: "Video Games",
+    description: "Placeholder: game data scrapers will live here",
+    icon: "🎮",
+    modules: [],
   },
 ];
 

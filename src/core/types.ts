@@ -91,6 +91,8 @@ export interface ScraperModule {
     productIds: string[],
     locationId: string,
   ): Promise<{ products: ProductDetails[]; calls: number; missing: string[] }>;
+  /** Id of the website scraper extension for this store (shows the Scraper tab). */
+  webExtension?: string;
   /** "store" (default) scrapes a store; "enricher" adds data to saved items (nutrition). */
   kind?: "store" | "enricher";
   /** Crawl limits for this store's search (page size, deepest page). */

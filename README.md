@@ -13,7 +13,9 @@ Self-hosted, modular scraper with a web UI. Runs as a Docker container on Unraid
 | Meijer  | Planned | TBD |
 | Target  | Planned | TBD |
 | Aldi    | Planned | TBD |
+| Kroger website (Scraper tab) | Working | Nutrition facts, ingredients, allergens from kroger.com via FlareSolverr |
 | USDA FoodData / Open Food Facts | Working | Adds nutrition facts + ingredients to saved items by UPC |
+| Video Games | Placeholder | Category tile only |
 
 ## Run locally (Mac)
 
@@ -122,6 +124,52 @@ ORDER BY recorded_on;
 
 All writes go through `saveItems()` in `src/core/items.ts`.
 
+## Scraper engine (`src/scraper`)
+
+A universal scraping core with per-site **extensions**:
+
+- **Runners** fetch pages: `flaresolverr` (a real Chrome in your FlareSolverr container, for
+  JavaScript-rendered and bot-protected sites) and `http` (plain requests for simple sites).
+  FlareSolverr is set up in Settings -> Connections (e.g. `http://192.168.1.76:8191/v1`).
+- **Extractors** shared by all sites: schema.org JSON-LD `Product`, amount parsing ("8g", "35mg"),
+  and block/challenge page detection.
+- **Extensions** (one small file per site) declare the runner, pacing, how to resolve user input
+  (URL / product ID / UPC) and how to read a product page. Kroger's is
+  `src/modules/groceries/kroger/web.ts`.
+- Every page visit goes through `engine.visit()`, which applies the safety rules below.
+
+### Safety rules (agreed for Kroger, defaults for any site)
+
+- **At most 50 pages per rolling hour**, with a **random 40-104 s gap** between pages (avg ~72 s).
+- **One browser session per run** (FlareSolverr session with its cookies), closed when the run ends.
+- **Stop at the first interruption**: a block/challenge page ("Access Denied", "Pardon Our
+  Interruption", ...), HTTP 403/429, a page with no product data, or a failed page load stops the
+  run and pauses that site for **6 hours**. The page is saved to
+  `/data/snapshots/<extension>/interruption/` so you can see what happened. The queue is kept.
+  "Resume now" on the Scraper tab clears the pause early.
+- The hourly count, the pause and the queue are saved in `/data/scraper/`, so restarts and
+  redeploys don't reset them.
+- **The scraper never writes prices** (a page's price belongs to whatever store the browser
+  session has); prices, price history and the removal rule stay with the API. It also doesn't
+  rename items the API created.
+
+### Kroger: API and Scraper tabs
+
+- **API tab**: everything from before (search, save, crawl, price update).
+- **Scraper tab**:
+  - **Add by item**: paste a kroger.com product URL, the product ID shown on the page
+    ("UPC: 0001111040101") or a 12-digit barcode. If the item isn't in the database yet and the
+    API is set up, the API creates it first (name, price at your picked store, link), then the
+    scraper adds nutrition facts, ingredients and allergens. **Dry run** previews without saving.
+    Manual items jump ahead of batch items in the queue.
+  - **Fill nutrition & ingredients**: adds a batch (default 50 = about one hour) of saved items
+    missing nutrition or ingredients. Optionally replaces USDA / Open Food Facts data with
+    Kroger's own label. Pages without a label (non-food) or not found are retried after 30 days.
+  - Saved data: `item_nf` (same shape as before), `item_ingredients`, and in `item_detail`:
+    `allergens`, `nutritionSource` (`kroger-web`), `scrapeLookup` (last result).
+- Raw pages from the last 20 visits are kept in `/data/snapshots/kroger-web/ok/` for checking
+  selectors if Kroger changes its page layout.
+
 ## Data rules (all stores)
 
 - **Re-saving updates, never duplicates** (matched on `store` + `store_product_id`), and never
@@ -170,7 +218,8 @@ Redis is not set up yet, so nothing runs automatically. The agreed plan, in `src
 |-----|------|
 | Kroger crawl | Weekly (Sunday night) |
 | Kroger price update (also applies the removal rule) | Daily |
-| Nutrition fill | Weekly, after the crawl |
+| Nutrition fill (USDA / Open Food Facts) | Weekly, after the crawl |
+| Kroger scraper (new items only) | Weekly, after the crawl, within 50/hour |
 
 The UI shows each plan as "on standby". When Redis is ready, the scheduler will start the same
 job functions the buttons use.
@@ -206,6 +255,8 @@ src/
   core/ratelimit.ts             waits to stay under hourly/minute limits (USDA, Open Food Facts)
   core/schedule.ts              planned automatic schedule (standby until Redis)
   modules/groceries/nutrition/  USDA + Open Food Facts lookups, UPC conversion, fill job
+  modules/groceries/kroger/web.ts  Kroger website extension (nutrition, ingredients, allergens)
+  scraper/                      engine: runners, extractors, pacer, scrape worker
   modules/groceries/kroger/     Kroger API client + normalizer
   modules/groceries/planned.ts  placeholders for the other stores
 public/                         plain HTML/CSS/JS UI

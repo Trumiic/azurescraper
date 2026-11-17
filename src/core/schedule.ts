@@ -17,6 +17,7 @@ export const PLANNED_SCHEDULE: PlannedRun[] = [
   { scope: "groceries/kroger", job: "crawl", every: "Weekly (Sunday night)" },
   { scope: "groceries/kroger", job: "prices", every: "Daily" },
   { scope: "groceries/nutrition", job: "fill", every: "Weekly (after the Kroger crawl)" },
+  { scope: "groceries/kroger-web", job: "scrape", every: "Weekly: new items only, after the crawl (50/hour)" },
 ];
 
 export function scheduleFor(scope: string) {
