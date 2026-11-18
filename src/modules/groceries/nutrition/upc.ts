@@ -75,3 +75,40 @@ export function barcodeCandidates(raw: string | null | undefined, store?: string
 
 /** Compare barcodes ignoring leading zeros (USDA stores 12 or 14 digit forms). */
 export const sameBarcode = (a: string, b: string) => a.replace(/^0+/, "") === b.replace(/^0+/, "");
+
+/**
+ * The one standard barcode stored per item (grocery_items.item_gtin): GTIN-14
+ * with the check digit computed, so the same product matches across stores
+ * no matter how each store writes its UPC.
+ *
+ *   Kroger  "0001111040101"  ("00" + UPC-A without check digit)
+ *   Meijer  "4125010200"     (UPC-A without check digit, leading zeros dropped)
+ *   others  "041250102007"   (full UPC-A / EAN-13 with check digit)
+ *
+ * Returns null for codes that aren't real product barcodes and must never be
+ * matched across stores: produce PLUs, variable-weight items packed in store
+ * (UPC starting with 2) and store-internal codes (starting with 4).
+ */
+export function toGtin14(store: string | undefined, raw: string | null | undefined): string | null {
+  const d = (raw ?? "").replace(/\D/g, "");
+  if (!d) return null;
+  let upcA: string | undefined;
+
+  if (store === "kroger" && d.length === 13 && d.startsWith("00")) {
+    const body = d.slice(2);                         // 11 digits, no check digit
+    if (/^0{6,}/.test(body)) return null;            // PLU (e.g. bananas 4011)
+    upcA = body + gs1CheckDigit(body);
+  } else if (store === "meijer" && d.length <= 11) {
+    if (d.length <= 5) return null;                  // PLU
+    const body = d.padStart(11, "0");                // UPC-A without check digit
+    upcA = body + gs1CheckDigit(body);
+  } else if (d.length >= 8 && d.length <= 14 && isValidGtin(d)) {
+    const g = d.padStart(14, "0");
+    if (g.startsWith("00")) upcA = g.slice(2);       // a US UPC-A inside GTIN-14
+    else return g;                                   // EAN-13 / GTIN-14 from elsewhere
+  } else {
+    return null;
+  }
+  if (upcA[0] === "2" || upcA[0] === "4") return null; // in-store / variable-weight codes
+  return upcA.padStart(14, "0");
+}

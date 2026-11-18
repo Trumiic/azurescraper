@@ -126,6 +126,11 @@ export function cancelJob(id: string) {
   job.log.push(`${new Date().toLocaleTimeString()}  Cancelling…`);
 }
 
+/** Every job still in memory (running, or finished within the last hour). */
+export function allJobs(): Job[] {
+  return [...jobs.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
 /** Current job (if any) plus the last finished run of each type, for one scope. */
 export function jobsFor(scope: string) {
   const current = runningJob(scope)

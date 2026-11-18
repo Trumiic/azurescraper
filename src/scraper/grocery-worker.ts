@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 import { currentTable, dbConfigured, getPool, quoteIdent } from "../core/db.js";
-import { ensureTable, saveItems } from "../core/items.js";
+import { ensureTable, markRemoved, saveItems } from "../core/items.js";
 import { startJob, runningJob, type JobContext } from "../core/jobs.js";
 import type { ProductDetails, ScraperModule } from "../core/types.js";
 import { closeExtensionSession, RunnerUnavailableError, visit } from "./engine.js";
@@ -39,6 +39,8 @@ export interface ScrapeResult {
   nutrients?: number;
   ingredients?: boolean;
   allergens?: boolean;
+  price?: number;
+  promoPrice?: number;
   message?: string;
 }
 
@@ -101,7 +103,8 @@ export async function scrapeCounts(store: string) {
        count(*) FILTER (WHERE item_ingredients IS NULL)::int missing_ingredients,
        count(*) FILTER (WHERE item_detail->'nutritionSource'->>'source' IN ('usda','off'))::int from_other,
        count(*) FILTER (WHERE item_detail->'nutritionSource'->>'source' = 'kroger-web')::int from_site,
-       count(*) FILTER (WHERE item_detail->'scrapeLookup'->>'result' = 'nolabel')::int no_label
+       count(*) FILTER (WHERE item_detail->'scrapeLookup'->>'result' = 'nolabel')::int no_label,
+       count(*) FILTER (WHERE last_seen_at IS NULL OR last_seen_at < now() - interval '20 hours')::int stale
      FROM ${T()} WHERE store = $1 AND removed_at IS NULL`, [store]);
   return r.rows[0];
 }
@@ -153,12 +156,33 @@ export async function enqueueManual(ext: ScraperExtension, input: string, opts: 
   return { queued: true, productId, url, position: q.indexOf(item) + 1, jobId: job?.id, note };
 }
 
-export async function enqueueFill(ext: ScraperExtension, opts: { limit: number; replaceOther: boolean }) {
+export async function enqueueFill(
+  ext: ScraperExtension,
+  opts: { limit: number; replaceOther: boolean; mode?: "missing" | "refresh" },
+) {
   if (!dbConfigured()) throw Object.assign(new Error("PostgreSQL is not configured (Settings → Connections)"), { statusCode: 400 });
   await ensureTable();
   const q = queueOf(ext);
   const queuedIds = q.map((x) => x.productId);
   const limit = Math.min(Math.max(1, Math.round(opts.limit)), 500);
+  if (opts.mode === "refresh") {
+    // Price refresh (stores whose prices come from this scraper): revisit saved items,
+    // least recently seen first, skipping anything seen in the last 20 hours.
+    if (!ext.ownsPrices) throw Object.assign(new Error(`${ext.name} doesn't own prices; use the API price update`), { statusCode: 400 });
+    const r = await getPool().query<{ store_product_id: string; item_name: string; item_url: string | null }>(
+      `SELECT store_product_id, item_name, item_url FROM ${T()}
+       WHERE store = $1 AND removed_at IS NULL AND NOT (store_product_id = ANY($2))
+         AND (last_seen_at IS NULL OR last_seen_at < now() - interval '20 hours')
+       ORDER BY last_seen_at NULLS FIRST
+       LIMIT $3`, [ext.store, queuedIds, limit]);
+    for (const row of r.rows) {
+      q.push({ productId: row.store_product_id, url: ext.productUrl(row.store_product_id, row.item_url),
+               name: row.item_name, kind: "fill", addedAt: Date.now() });
+    }
+    persistQueue(ext);
+    const job = r.rows.length ? ensureWorker(ext) : null;
+    return { added: r.rows.length, queueLength: q.length, jobId: job?.id };
+  }
   const r = await getPool().query<{ store_product_id: string; item_name: string; item_url: string | null }>(
     `SELECT store_product_id, item_name, item_url FROM ${T()}
      WHERE store = $1 AND removed_at IS NULL
@@ -222,6 +246,7 @@ async function work(ext: ScraperExtension, ctx: JobContext): Promise<string> {
       try {
         const { data, notFound, page } = await visit(ext, item.url, {
           label: item.productId,
+          productId: item.productId,
           cancelled: () => ctx.cancelled,
           onWait: (ms, why) => {
             if (!waitedNote && ms > 5000) {
@@ -287,11 +312,32 @@ async function handle(ext: ScraperExtension, ctx: JobContext, item: QueueItem, d
     ctx.stat("notFound");
     ctx.log(`Not found on ${ext.name}: ${name ?? item.productId}`);
     await recordLookup(ext.store, item.productId, "notfound");
+    // Removal rule: the page for this exact product id is gone. When the scraper is
+    // the store's only source, that's the store's confirmation -> soft-remove.
+    if (ext.ownsPrices) {
+      const removed = await markRemoved(ext.store, [item.productId]);
+      if (removed.length) { ctx.stat("removed"); ctx.log(`Removed (no longer at ${ext.name}): ${removed[0]}`); }
+    }
     pushResult(ext, { ...base, name, result: "notfound" });
     return;
   }
 
   const now = new Date().toISOString();
+
+  // Prices: only for stores whose prices come from this scraper, and only from the right store.
+  let price: number | undefined;
+  let promoPrice: number | undefined;
+  let priceNote: string | undefined;
+  if (ext.ownsPrices && p.price !== undefined) {
+    const want = ext.priceStore?.();
+    if (want && data.storeId && data.storeId !== want) {
+      priceNote = `price skipped: page was priced for store ${data.storeId}${data.storeName ? ` (${data.storeName})` : ""}, not ${want}`;
+      ctx.log(`${name ?? item.productId}: ${priceNote}`);
+    } else {
+      price = p.price;
+      promoPrice = p.promoPrice;
+    }
+  }
   const details: ProductDetails = {
     store: ext.store,
     productId: p.productId === item.productId ? p.productId : item.productId,
@@ -302,26 +348,36 @@ async function handle(ext: ScraperExtension, ctx: JobContext, item: QueueItem, d
     url: finalUrl.split("?")[0],
     nutrition: p.nutrition,
     ingredients: p.ingredients,
+    price,
+    promoPrice,
+    locationId: price !== undefined ? data.storeId : undefined,
+    stockLevel: price !== undefined ? p.stockLevel : undefined,
+    aisle: p.aisle,
+    categories: p.categories,
     scrapedAt: now,
     extra: {
+      ...(p.extra ?? {}),
       ...(data.allergens ? { allergens: data.allergens } : {}),
       ...(p.nutrition || p.ingredients
         ? { nutritionSource: { source: ext.id, name: ext.name, url: finalUrl.split("?")[0], basis: "serving", at: now } }
         : {}),
       scrapeLookup: { at: now, result: data.noLabel ? "nolabel" : "found" },
     },
-    // price intentionally left undefined: the API owns prices
+    // price stays undefined unless this scraper owns the store's prices (see above)
   };
   await saveItems([details]);
 
   if (data.noLabel) {
     ctx.stat("noLabel");
+    if (price !== undefined) ctx.stat("pricePoints");
     ctx.log(`No nutrition label on the page: ${details.name}`);
-    pushResult(ext, { ...base, name: details.name, result: "nolabel" });
+    pushResult(ext, { ...base, name: details.name, result: "nolabel", price, promoPrice, message: priceNote });
   } else {
     ctx.stat("saved");
+    if (price !== undefined) ctx.stat("pricePoints");
     pushResult(ext, { ...base, name: details.name, result: "saved", nutrients: p.nutrition?.nutrients.length ?? 0,
-                      ingredients: Boolean(p.ingredients), allergens: Boolean(data.allergens) });
+                      ingredients: Boolean(p.ingredients), allergens: Boolean(data.allergens),
+                      price, promoPrice, message: priceNote });
   }
 }
 

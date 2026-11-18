@@ -1,12 +1,15 @@
 import type { Category } from "./types.js";
 import { kroger } from "../modules/groceries/kroger/index.js";
-import { walmart, meijer, target, aldi } from "../modules/groceries/planned.js";
+import { walmart, target, aldi } from "../modules/groceries/planned.js";
+import { meijer } from "../modules/groceries/meijer/index.js";
+import { meijerWeb } from "../modules/groceries/meijer/web.js";
 import { nutrition } from "../modules/groceries/nutrition/index.js";
 import { krogerWeb } from "../modules/groceries/kroger/web.js";
 import { registerExtension } from "../scraper/engine.js";
 
 // Website scraper extensions (see src/scraper)
 registerExtension(krogerWeb);
+registerExtension(meijerWeb);
 
 /**
  * Every category tile on the home page, and the modules inside it.

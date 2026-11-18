@@ -43,6 +43,9 @@ export interface ExtractResult {
   allergens?: string;
   /** Page is a product but has no nutrition label (e.g. paper towels). */
   noLabel?: boolean;
+  /** Store the page's prices belong to (for sites whose prices are store-specific). */
+  storeId?: string;
+  storeName?: string;
   warnings?: string[];
 }
 
@@ -56,7 +59,16 @@ export interface ScraperExtension {
   /** Turn user input (URL / id / UPC) into a product id + URL, or null if not understood. */
   resolveInput(input: string): { productId: string; url?: string } | null;
   productUrl(productId: string, savedUrl?: string | null): string;
-  extract(page: FetchedPage): ExtractResult;
+  extract(page: FetchedPage, productId?: string): ExtractResult;
+  /**
+   * Price ownership: true when this scraper is the store's only price source
+   * (no API). Then it writes prices + price history, and a confirmed 404 soft-
+   * removes the item. When false (e.g. Kroger, whose API owns prices) it never
+   * touches prices.
+   */
+  ownsPrices?: boolean;
+  /** The store prices must come from (if set, pages priced for another store are not saved). */
+  priceStore?(): string | undefined;
 }
 
 /** The site stopped serving normal pages: block page, challenge, 403/429, or an unexpected page. */

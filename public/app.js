@@ -42,6 +42,7 @@ async function renderHome() {
   setCrumbs([]);
   const cats = await api("/api/categories");
   view.innerHTML = `
+    <section id="activity" class="activity"></section>
     <h1>Categories</h1>
     <p class="sub">Pick a category to see its scraper modules.</p>
     <div class="tiles">
@@ -58,6 +59,62 @@ async function renderHome() {
           </div>
         </a>`).join("")}
     </div>`;
+  mountActivity(document.getElementById("activity")).catch(() => {});
+}
+
+/* ---------- Home: live activity (running jobs, paused scrapers) ---------- */
+async function mountActivity(el) {
+  let ticker;
+  const render = async () => {
+    if (!el.isConnected) return clearInterval(ticker);
+    let a;
+    try { a = await api("/api/activity"); } catch { a = { jobs: [], paused: [] }; }
+    const running = a.jobs.filter((j) => j.status === "running");
+    const recent = a.jobs.filter((j) => j.status !== "running").slice(0, 3);
+
+    const jobRow = (j) => {
+      const pct = j.progress.total ? Math.round((100 * j.progress.done) / j.progress.total) : 0;
+      const live = j.status === "running";
+      const next = live && j.nextPageAt && j.nextPageAt - Date.now() > 1500
+        ? ` · next page in <b data-countdown="${j.nextPageAt}">${fmtWait(j.nextPageAt - Date.now())}</b>` : "";
+      const warn = j.status === "failed" || /^Stopped early/.test(j.message ?? "");
+      return `
+        <a class="act-row ${live ? "live" : ""}" href="${esc(j.where.href)}">
+          <div class="act-main">
+            <div class="act-title">${live ? '<span class="dot"></span>' : ""}<b>${esc(JOB_TITLE[j.type] ?? j.type)}</b>
+              <span class="meta">· ${esc(j.where.label)}</span></div>
+            <div class="meta act-sub">${live
+              ? `${j.progress.done.toLocaleString()} / ${j.progress.total.toLocaleString()}${next}`
+              : `<span class="result ${warn ? "bad" : "ok"}">${esc(j.message ?? j.status)}</span> · ${esc(new Date(j.finishedAt).toLocaleTimeString())}`}</div>
+            ${live ? `<div class="bar"><div style="width:${pct}%"></div></div>` : ""}
+          </div>
+          <div class="chips">${statChips(j.stats)}</div>
+        </a>`;
+    };
+
+    el.innerHTML = `
+      <div class="act-head"><h2>Activity</h2>
+        <span class="meta">${running.length ? `${running.length} running` : "Nothing running"}</span></div>
+      ${a.paused.map((p) => `
+        <a class="act-row paused" href="${esc(p.where.href)}">
+          <div class="act-main">
+            <div class="act-title"><b>Paused</b> <span class="meta">· ${esc(p.where.label)}</span></div>
+            <div class="meta act-sub">${esc(p.reason ?? "Interruption")} · resumes ${esc(new Date(p.until).toLocaleString())}
+              (${fmtWait(p.until - Date.now())})${p.queued ? ` · ${p.queued} queued` : ""}</div>
+          </div>
+        </a>`).join("")}
+      ${running.map(jobRow).join("")}
+      ${recent.length ? `<div class="meta act-recent-label">Finished recently</div>${recent.map(jobRow).join("")}` : ""}`;
+
+    clearInterval(ticker);
+    ticker = setInterval(() => {
+      if (!el.isConnected) return clearInterval(ticker);
+      el.querySelectorAll("[data-countdown]").forEach((c) => { c.textContent = fmtWait(Number(c.dataset.countdown) - Date.now()); });
+    }, 1000);
+    clearTimeout(el._poll);
+    el._poll = setTimeout(render, running.length ? 3000 : 15000);
+  };
+  await render();
 }
 
 /* ---------- Category: module tiles ---------- */
@@ -98,7 +155,8 @@ async function renderModule(catId, modId, tab) {
   const locKey = `azs.${modId}.location`;
 
   if (mod.kind === "enricher" && mod.status === "ready") return renderNutrition();
-  if (mod.webExtension && tab === "scraper") return renderScraperTab(cat, mod);
+  // Scraper-only stores (no API, e.g. Meijer) always open on the Scraper tab.
+  if (mod.webExtension && (tab === "scraper" || !mod.canSearch)) return renderScraperTab(cat, mod);
 
   if (mod.status === "needs-config") {
     view.innerHTML = `
@@ -617,7 +675,7 @@ function moduleTabs(catId, mod, active) {
   if (!mod.webExtension) return "";
   return `
     <nav class="tabs">
-      <a href="#/c/${catId}/${mod.id}" class="${active === "api" ? "active" : ""}">API</a>
+      ${mod.canSearch ? `<a href="#/c/${catId}/${mod.id}" class="${active === "api" ? "active" : ""}">API</a>` : ""}
       <a href="#/c/${catId}/${mod.id}/scraper" class="${active === "scraper" ? "active" : ""}">Scraper</a>
     </nav>`;
 }
@@ -648,20 +706,25 @@ async function renderScraperTab(cat, mod) {
   view.innerHTML = `
     <h1>${esc(mod.name)} <span class="pill ready">Scraper</span></h1>
     ${moduleTabs(cat.id, mod, "scraper")}
-    <p class="sub">Reads nutrition facts, ingredients and allergens from ${esc(mod.name)}'s product pages using a real browser
-      (FlareSolverr). Prices stay on the API tab.</p>
+    <p class="sub">${mod.canSearch
+      ? `Reads nutrition facts, ingredients and allergens from ${esc(mod.name)}'s product pages using a real browser
+         (FlareSolverr). Prices stay on the API tab.`
+      : `${esc(mod.name)} has no public API, so everything comes from its product pages (real browser via FlareSolverr):
+         name, UPC, image, regular and sale price (with sale end date), stock, aisle, category, ingredients and nutrition facts.`}</p>
     <div id="scStatus"></div>
 
     <div class="panel">
       <h2>Add by item</h2>
-      <p class="meta">Paste a product URL, the product ID shown on the page ("UPC: 000…"), or a 12-digit barcode.
+      <p class="meta">Paste a product URL, the product ID / UPC shown on the page, or a 12-digit barcode.
         Manual items go to the front of the queue.</p>
       <form id="scAdd" class="row" style="margin-top:10px">
-        <input id="scInput" class="grow" placeholder="https://www.kroger.com/p/…/0001111040101  or  0001111040101" />
+        <input id="scInput" class="grow" placeholder="${mod.id === "meijer" ? "https://www.meijer.com/shopping/product/…/4125010200  or  4125010200" : "https://www.kroger.com/p/…/0001111040101  or  0001111040101"}" />
         <label class="check"><input type="checkbox" id="scDry" /> Dry run (preview, don't save)</label>
         <button type="submit">Queue</button>
       </form>
-      <div id="scAddMsg" class="meta" style="margin-top:8px">${savedLoc
+      <div id="scAddMsg" class="meta" style="margin-top:8px">${!mod.canSearch
+        ? "New items are created straight from the product page, including the price."
+        : savedLoc
         ? `New items are created through the API at your picked store: ${esc(savedLoc.label)}.`
         : "Tip: pick a store on the API tab so new items also get a price from the API."}</div>
       <div id="scPreview"></div>
@@ -678,6 +741,7 @@ async function renderScraperTab(cat, mod) {
         </label>
         <label class="check"><input type="checkbox" id="scReplace" checked /> Replace USDA / Open Food Facts data with ${esc(mod.name)}'s label</label>
         <button id="scFill">Add batch to queue</button>
+        ${mod.canSearch ? "" : `<button id="scRefresh" class="ghost">Refresh prices (oldest first)</button>`}
       </div>
       <div id="scFillMsg" class="meta" style="margin-top:8px"></div>
     </div>
@@ -713,6 +777,9 @@ async function renderScraperTab(cat, mod) {
             <h3>Browser: ${esc(s.runner.name)} <span class="pill ${s.runner.ready ? "ready" : "needs-config"}">${s.runner.ready ? "Ready" : "Not set up"}</span></h3>
             <p class="meta">${s.runner.ready ? "One browser session per run, closed when the run ends."
               : `Add your FlareSolverr URL in <a href="#/settings/connections" style="color:var(--azure)">Settings → Connections</a>.`}</p>
+            ${s.ownsPrices ? `<p class="meta">Prices: from this scraper, ${s.priceStore
+              ? `only for store <b>${esc(s.priceStore)}</b>`
+              : `for whichever store ${esc(mod.name)} picks (set one in Settings → Connections → ${esc(mod.name)})`}.</p>` : ""}
             ${s.dbConfigured ? "" : `<p class="result bad">PostgreSQL not configured: only dry runs work.</p>`}
           </div>
           <div class="bulk-card">
@@ -743,8 +810,10 @@ async function renderScraperTab(cat, mod) {
     return `<table class="nf-table recent"><tbody>${list.map((r) => {
       const [cls, label] = RESULT_LABEL[r.result] ?? ["planned", r.result];
       const detail = r.result === "saved" || r.result === "preview"
-        ? `${r.nutrients} nutrients · ingredients ${r.ingredients ? "✓" : "–"} · allergens ${r.allergens ? "✓" : "–"}`
-        : esc(r.message ?? "");
+        ? `${r.nutrients} nutrients · ingredients ${r.ingredients ? "✓" : "–"} · allergens ${r.allergens ? "✓" : "–"}${
+            r.price != null ? ` · ${r.promoPrice != null ? `<b class="sale">${money(r.promoPrice)}</b> <s>${money(r.price)}</s>` : money(r.price)}` : ""}${
+            r.message ? ` · <span class="result bad">${esc(r.message)}</span>` : ""}`
+        : `${r.price != null ? `${money(r.promoPrice ?? r.price)} · ` : ""}${esc(r.message ?? "")}`;
       return `<tr>
         <td class="meta">${esc(new Date(r.at).toLocaleString())}</td>
         <td><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name ?? r.productId)}</a>${r.kind === "manual" ? " <span class='meta'>★</span>" : ""}</td>
@@ -766,6 +835,7 @@ async function renderScraperTab(cat, mod) {
         ? `<b>${c.total.toLocaleString()}</b> items · <b>${c.missing_nf.toLocaleString()}</b> missing nutrition ·
            <b>${c.missing_ingredients.toLocaleString()}</b> missing ingredients · ${c.from_other.toLocaleString()} from USDA/Open Food Facts ·
            ${c.from_site.toLocaleString()} from ${esc(mod.name)}'s site · ${c.no_label.toLocaleString()} ${c.no_label === 1 ? "page" : "pages"} without a label.
+           ${s.ownsPrices ? ` · <b>${c.stale.toLocaleString()}</b> prices older than 20 h.` : ""}
            At ${s.pacer.maxPerHour}/hour, 50 items take about an hour.`
         : "Add PostgreSQL to fill saved items.";
       document.getElementById("scRecent").innerHTML = recentHtml(s.recent);
@@ -818,6 +888,18 @@ async function renderScraperTab(cat, mod) {
     } catch (x) { msg.className = "result bad"; msg.textContent = x.message; }
   });
 
+  document.getElementById("scRefresh")?.addEventListener("click", async () => {
+    err.textContent = "";
+    const msg = document.getElementById("scFillMsg");
+    try {
+      const r = await api(`${base}/fill`, { method: "POST", body: {
+        limit: Number(document.getElementById("scLimit").value), mode: "refresh" } });
+      msg.className = r.added ? "result ok" : "meta";
+      msg.textContent = r.added ? `Added ${r.added} items for a price refresh (${r.queueLength} queued).` : "Every item was checked in the last 20 hours.";
+      await refresh();
+    } catch (x) { msg.className = "result bad"; msg.textContent = x.message; }
+  });
+
   document.getElementById("scRecent").addEventListener("click", async (e) => {
     const id = e.target.closest("[data-preview]")?.dataset.preview;
     if (!id) return;
@@ -831,6 +913,9 @@ async function renderScraperTab(cat, mod) {
           <h4>Dry run: ${esc(prod.name ?? id)}</h4>
           <div class="meta"><a href="${esc(p.url)}" target="_blank" rel="noopener" style="color:var(--azure)">Open page ↗</a>
             · Serving: ${esc(prod.nutrition?.servingSize ?? "—")} · Servings: ${esc(prod.nutrition?.servingsPerPackage ?? "—")}</div>
+          ${prod.price != null ? `<div class="meta">Price: ${prod.promoPrice != null ? `<b class="result ok">${money(prod.promoPrice)}</b> (was ${money(prod.price)}${prod.extra?.promoEnds ? `, sale ends ${esc(new Date(prod.extra.promoEnds).toLocaleDateString())}` : ""})` : money(prod.price)}
+            ${p.data.storeId ? ` · store ${esc(p.data.storeId)}${p.data.storeName ? ` (${esc(p.data.storeName)})` : ""}` : ""}
+            ${prod.aisle ? ` · aisle ${esc(prod.aisle)}` : ""}${prod.stockLevel ? ` · ${esc(prod.stockLevel)}` : ""}</div>` : ""}
           ${rows ? `<table class="nf-table"><tbody>${rows}</tbody></table>` : `<p class="meta">No nutrition label found.</p>`}
           <div class="nf-ingr"><b>Ingredients:</b> ${esc(prod.ingredients ?? "—")}</div>
           <div class="nf-ingr"><b>Allergens:</b> ${esc(p.data.allergens ?? "—")}</div>

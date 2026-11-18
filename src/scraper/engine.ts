@@ -56,7 +56,7 @@ export interface VisitResult {
 export async function visit(
   ext: ScraperExtension,
   url: string,
-  opts: { label: string; cancelled?: () => boolean; onWait?: (ms: number, why: string) => void },
+  opts: { label: string; productId?: string; cancelled?: () => boolean; onWait?: (ms: number, why: string) => void },
 ): Promise<VisitResult> {
   const runner = runners[ext.runner];
   if (!runner?.ready()) throw new RunnerUnavailableError(`${runner?.name ?? ext.runner} is not set up (Settings → Connections)`);
@@ -84,7 +84,7 @@ export async function visit(
     return { page, data: { isProductPage: false }, notFound: true };
   }
 
-  const data = ext.extract(page);
+  const data = ext.extract(page, opts.productId);
   if (!data.isProductPage) {
     // Not a block page we recognise, but not a product page either: back off to be safe.
     const why = `Unexpected page (HTTP ${page.status}, no product data)`;

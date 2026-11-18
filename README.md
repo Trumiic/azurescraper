@@ -9,8 +9,8 @@ Self-hosted, modular scraper with a web UI. Runs as a Docker container on Unraid
 | Module  | Status  | Method |
 |---------|---------|--------|
 | Kroger  | Working | Official Kroger Public API (OAuth2, JSON) |
+| Meijer (Scraper tab) | Working | meijer.com product record via FlareSolverr: prices, sales, nutrition, ingredients |
 | Walmart | Planned | Embedded JSON in page HTML |
-| Meijer  | Planned | TBD |
 | Target  | Planned | TBD |
 | Aldi    | Planned | TBD |
 | Kroger website (Scraper tab) | Working | Nutrition facts, ingredients, allergens from kroger.com via FlareSolverr |
@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS grocery_items (
   store_product_id  TEXT NOT NULL,          -- the store's product id
   item_name         TEXT NOT NULL,
   item_price        NUMERIC(10,2),          -- regular price at the chosen store
-  item_upc          TEXT,
+  item_upc          TEXT,                   -- the store's own UPC format
+  item_gtin         TEXT,                   -- standard 14-digit barcode: match items across stores on this
   item_url          TEXT,                   -- product page on the store's site
   item_detail       JSONB,                  -- brand, size, promoPrice, stockLevel, aisle, categories, locationId, scrapedAt
   item_nf           JSONB,                  -- {servingSize, servingsPerPackage, nutrients:[{name, amount, unit, dailyValue}]}
@@ -124,6 +125,13 @@ ORDER BY recorded_on;
 
 All writes go through `saveItems()` in `src/core/items.ts`.
 
+## Home page: Activity
+
+Above the categories, a live **Activity** section shows every running job (crawl, price update,
+nutrition fill, scraper) with progress and, for scrapers, a countdown to the next page. It also
+shows any scraper that is **paused** after an interruption (reason, resume time, items queued) and
+jobs that finished in the last 10 minutes. Click a row to open its page. Data: `GET /api/activity`.
+
 ## Scraper engine (`src/scraper`)
 
 A universal scraping core with per-site **extensions**:
@@ -153,6 +161,39 @@ A universal scraping core with per-site **extensions**:
   session has); prices, price history and the removal rule stay with the API. It also doesn't
   rename items the API created.
 
+### Price ownership (all stores)
+
+Each store gets its prices from exactly one source, so prices never mix:
+
+| Store | Price source | Scraper writes prices? |
+|-------|--------------|------------------------|
+| Kroger | Kroger API (API tab) | No: the Kroger scraper only adds nutrition, ingredients, allergens |
+| Meijer | Meijer scraper (no public API) | Yes, plus price history, sale price and sale end date |
+
+An extension declares this with `ownsPrices`. When a scraper owns prices it also applies the removal
+rule (a 404 for that exact product = soft remove), and offers **Refresh prices** (revisit saved items,
+least recently seen first, skipping anything seen in the last 20 hours).
+
+### Meijer (Scraper tab only)
+
+meijer.com product pages embed a full product record in their Next.js page data
+(`self.__next_f.push(...)`). The extension (`src/modules/groceries/meijer/web.ts`) decodes it and reads:
+
+- `productName`, `brandDescription`, `upc` (UPC without check digit, e.g. `4125010200`)
+- prices from `storeSpecificProductDetails.productStore`: `basePrice` -> `item_price`,
+  `customerPrice` when `isOnSale` -> sale price, `priceEndDate` -> `item_detail.promoEnds`,
+  `savingsDescription`, `clearancePrice`
+- store (`storeId`, store name), stock status, aisle location (`ilcPrimary`)
+- `ingredients`, nutrition from `nutritionLabelHeader/Main/MicroNutrients/Vitamin/Mineral`
+  (rows of `{n: name, v: value, u: unit, p: %DV}`), category path (`taxonomy`), images, description
+- **Unit sanity check**: when an amount disagrees with its %DV by exactly 1,000x (e.g. Meijer's
+  "Calcium 210mcg 15%"), the unit is corrected and noted in `item_detail.nutritionNotes`.
+
+Settings -> Connections -> **Meijer**: optional **Store ID** (e.g. `220`). When set, pages priced
+for another store don't save a price. meijer.com picks the store from your IP when none is set.
+
+Data quality is Meijer's: some products have thin data (the milk's ingredients are literally "V D3.").
+
 ### Kroger: API and Scraper tabs
 
 - **API tab**: everything from before (search, save, crawl, price update).
@@ -169,6 +210,24 @@ A universal scraping core with per-site **extensions**:
     `allergens`, `nutritionSource` (`kroger-web`), `scrapeLookup` (last result).
 - Raw pages from the last 20 visits are kept in `/data/snapshots/kroger-web/ok/` for checking
   selectors if Kroger changes its page layout.
+
+## Matching the same product across stores (`item_gtin`)
+
+Stores write UPCs differently: Kroger `0004125010200` ("00" + UPC without check digit), Meijer
+`4125010200` (no check digit, no leading zeros), Target/Walmart `041250102007` (full UPC-A with check
+digit). AzureScraper stores one standard barcode per item in `item_gtin`: the GTIN-14 with the
+check digit computed (all four examples become `00041250102007`). It is **NULL** for produce PLUs,
+variable-weight items packed in store (UPC starting with 2) and store-internal codes (starting
+with 4): those are store-specific numbers, not product barcodes, and must not be matched.
+
+```sql
+-- every store's current listing of one product
+SELECT store, item_name, item_price, item_detail->>'promoPrice' AS sale_price, item_url
+FROM grocery_items
+WHERE item_gtin = $1 AND removed_at IS NULL;
+```
+
+Existing rows are filled in automatically the first time the new version touches the database.
 
 ## Data rules (all stores)
 

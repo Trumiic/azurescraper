@@ -19,14 +19,14 @@ import {
 } from "./core/connections.js";
 import { currentTable, dbConfigured } from "./core/db.js";
 import { countStoreItems, createTableSql, historyTableName, savedIds, saveItems } from "./core/items.js";
-import { cancelJob, jobsFor } from "./core/jobs.js";
+import { allJobs, cancelJob, jobsFor } from "./core/jobs.js";
 import { getCrawlSettings, setCrawlSettings, startCrawl, startPriceUpdate } from "./core/grocery-jobs.js";
 import { scheduleFor } from "./core/schedule.js";
 import {
   applyLookup, clearNutrition, listNutritionItems, lookupItem, NUTRITION_SCOPE, nutritionCounts, startNutritionFill,
 } from "./modules/groceries/nutrition/index.js";
 import { usdaConfigured } from "./modules/groceries/nutrition/usda.js";
-import { getExtension, runners } from "./scraper/engine.js";
+import { getExtension, listExtensions, runners } from "./scraper/engine.js";
 import { clearCooldown, pacerStatus } from "./scraper/pacer.js";
 import {
   clearQueue, enqueueFill, enqueueManual, getPreview, runQueue, scrapeCounts, workerStatus,
@@ -37,7 +37,12 @@ const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
 
 loadConnections();
 
-await app.register(fastifyStatic, { root: path.join(__dirname, "..", "public") });
+await app.register(fastifyStatic, {
+  root: path.join(__dirname, "..", "public"),
+  // Always revalidate, so the browser picks up a new app.js right after a deploy.
+  cacheControl: false,
+  setHeaders: (res) => res.setHeader("Cache-Control", "no-cache"),
+});
 
 /* ---------- Serializers (modules contain functions, so send plain data) ---------- */
 
@@ -312,6 +317,46 @@ app.post<{ Body: { store?: string } }>("/api/nutrition/jobs/fill", async (req, r
   return reply.code(202).send(startNutritionFill(req.body?.store || undefined));
 });
 
+/* ---------- Activity: everything running right now (home page) ---------- */
+
+/** "groceries/kroger-web" -> where it lives in the UI. */
+function scopeInfo(scope: string) {
+  const [catId, id] = scope.split("/");
+  const cat = findCategory(catId);
+  const mod = cat?.modules.find((m) => m.id === id);
+  if (mod) return { label: mod.name, area: cat!.name, href: `#/c/${catId}/${mod.id}` };
+  const ext = getExtension(id);
+  if (ext) {
+    const owner = cat?.modules.find((m) => m.webExtension === ext.id);
+    return { label: `${owner?.name ?? ext.name} · Scraper`, area: cat?.name ?? "", href: `#/c/${catId}/${owner?.id ?? ""}/scraper` };
+  }
+  return { label: scope, area: "", href: "#/" };
+}
+
+app.get("/api/activity", async () => {
+  const recentMs = 10 * 60 * 1000;
+  const jobs = allJobs()
+    .filter((j) => j.status === "running" || (j.finishedAt && Date.now() - Date.parse(j.finishedAt) < recentMs))
+    .map((j) => {
+      const ext = getExtension(j.scope.split("/")[1]);
+      return {
+        id: j.id, type: j.type, status: j.status, progress: j.progress, stats: j.stats,
+        message: j.message, startedAt: j.startedAt, finishedAt: j.finishedAt,
+        lastLog: j.log[j.log.length - 1] ?? null,
+        where: scopeInfo(j.scope),
+        nextPageAt: ext && j.status === "running" ? pacerStatus(ext.id, ext.pacing).nextAt : null,
+      };
+    });
+  const paused = listExtensions()
+    .map((ext) => ({ ext, p: pacerStatus(ext.id, ext.pacing), w: workerStatus(ext) }))
+    .filter((x) => x.p.cooldownUntil)
+    .map((x) => ({
+      where: scopeInfo(`groceries/${x.ext.id}`),
+      until: x.p.cooldownUntil, reason: x.p.cooldownReason, queued: x.w.queueLength,
+    }));
+  return { jobs, paused };
+});
+
 /* ---------- Website scraper (per extension, e.g. kroger-web) ---------- */
 
 function requireExtension(id: string) {
@@ -330,6 +375,8 @@ app.get<{ Params: { ext: string } }>("/api/scraper/:ext", async (req) => {
     id: ext.id,
     name: ext.name,
     store: ext.store,
+    ownsPrices: Boolean(ext.ownsPrices),
+    priceStore: ext.priceStore?.() ?? null,
     runner: { id: runner.id, name: runner.name, ready: runner.ready() },
     pacer: pacerStatus(ext.id, ext.pacing),
     counts: await scrapeCounts(ext.store).catch(() => null),
@@ -356,11 +403,15 @@ app.post<{ Params: { ext: string }; Body: { input?: string; dryRun?: boolean; lo
   },
 );
 
-app.post<{ Params: { ext: string }; Body: { limit?: number; replaceOther?: boolean } }>(
+app.post<{ Params: { ext: string }; Body: { limit?: number; replaceOther?: boolean; mode?: "missing" | "refresh" } }>(
   "/api/scraper/:ext/fill",
   async (req, reply) => {
     const ext = requireExtension(req.params.ext);
-    const r = await enqueueFill(ext, { limit: Number(req.body?.limit ?? 50), replaceOther: Boolean(req.body?.replaceOther) });
+    const r = await enqueueFill(ext, {
+      limit: Number(req.body?.limit ?? 50),
+      replaceOther: Boolean(req.body?.replaceOther),
+      mode: req.body?.mode === "refresh" ? "refresh" : "missing",
+    });
     return reply.code(202).send(r);
   },
 );

@@ -5,7 +5,15 @@ import * as cheerio from "cheerio";
 
 export type Doc = cheerio.CheerioAPI;
 export const loadHtml = (html: string): Doc => cheerio.load(html);
-export const clean = (s?: string | null) => (s ?? "").replace(/\s+/g, " ").trim();
+/** Collapse whitespace and fix Windows-1252 "smart" characters that show up as control codes. */
+export const clean = (s?: string | null) =>
+  (s ?? "")
+    .replace(/[\u0091\u0092]/g, "\u2019")
+    .replace(/[\u0093\u0094]/g, "\"")
+    .replace(/[\u0096\u0097]/g, "\u2013")
+    .replace(/[\u0080-\u009f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
 /* ---------- schema.org JSON-LD ---------- */
 

@@ -22,6 +22,7 @@
  */
 import { currentTable, getPool, quoteIdent } from "./db.js";
 import type { ProductDetails } from "./types.js";
+import { toGtin14 } from "../modules/groceries/nutrition/upc.js";
 
 /** grocery_items -> grocery_item_prices; anything else -> <table>_prices */
 export function historyTableName(table: string) {
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS ${t} (
   store_product_id  TEXT NOT NULL,
   item_name         TEXT NOT NULL,
   item_price        NUMERIC(10,2),
-  item_upc          TEXT,
+  item_upc          TEXT,                   -- the store's own UPC format
+  item_gtin         TEXT,                   -- standard 14-digit barcode: match items across stores on this
   item_url          TEXT,
   item_detail       JSONB,
   item_nf           JSONB,
@@ -53,6 +55,8 @@ CREATE TABLE IF NOT EXISTS ${t} (
 -- upgrades from earlier versions
 ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
 ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
+ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS item_gtin TEXT;
+CREATE INDEX IF NOT EXISTS ${quoteIdent(`${table}_gtin_idx`)} ON ${t} (item_gtin);
 CREATE INDEX IF NOT EXISTS ${quoteIdent(`${table}_upc_idx`)} ON ${t} (item_upc);
 
 CREATE TABLE IF NOT EXISTS ${quoteIdent(h)} (
@@ -73,7 +77,23 @@ const ensured = new Set<string>();
 export async function ensureTable(table = currentTable()) {
   if (ensured.has(table)) return;
   await getPool().query(createTableSql(table));
+  await backfillGtin(table);
   ensured.add(table);
+}
+
+/** One-time fill of item_gtin for rows saved before the column existed. */
+async function backfillGtin(table: string) {
+  const t = quoteIdent(table);
+  const rows = await getPool().query<{ id: string; store: string; item_upc: string | null; store_product_id: string }>(
+    `SELECT id::text, store, item_upc, store_product_id FROM ${t}
+     WHERE item_gtin IS NULL AND NOT (COALESCE(item_detail, '{}'::jsonb) ? 'gtinChecked')`);
+  for (const r of rows.rows) {
+    const gtin = toGtin14(r.store, r.item_upc ?? r.store_product_id);
+    await getPool().query(
+      `UPDATE ${t} SET item_gtin = $2,
+         item_detail = COALESCE(item_detail, '{}'::jsonb) || '{"gtinChecked": true}'::jsonb
+       WHERE id = $1`, [r.id, gtin]);
+  }
 }
 
 export interface ItemRow {
@@ -82,6 +102,7 @@ export interface ItemRow {
   item_name: string;
   item_price: number | null;
   item_upc: string | null;
+  item_gtin: string | null;
   item_url: string | null;
   item_detail: Record<string, unknown>;
   item_nf: unknown;
@@ -112,6 +133,7 @@ export function toRow(p: ProductDetails): ItemRow {
     item_name: p.name,
     item_price: p.price ?? null,
     item_upc: p.upc ?? null,
+    item_gtin: toGtin14(p.store, p.upc ?? p.productId),
     item_url: p.url ?? null,
     item_detail: detail,
     item_nf: p.nutrition && p.nutrition.nutrients.length ? p.nutrition : null,
@@ -143,13 +165,14 @@ export async function saveItems(items: ProductDetails[]): Promise<SaveResult> {
       const res = await client.query<{ id: string; inserted: boolean }>(
         `INSERT INTO ${t}
            (store, store_product_id, item_name, item_price, item_upc, item_url,
-            item_detail, item_nf, item_ingredients, item_image, last_seen_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
+            item_detail, item_nf, item_ingredients, item_image, item_gtin, last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
          ON CONFLICT (store, store_product_id) DO UPDATE SET
            item_name = EXCLUDED.item_name,
            -- Kroger only returns prices for a specific store; don't wipe a known price
            item_price = COALESCE(EXCLUDED.item_price, ${t}.item_price),
            item_upc = COALESCE(EXCLUDED.item_upc, ${t}.item_upc),
+           item_gtin = COALESCE(EXCLUDED.item_gtin, ${t}.item_gtin),
            item_url = COALESCE(EXCLUDED.item_url, ${t}.item_url),
            -- merge, so keys missing from this scrape (e.g. locationId) are kept
            item_detail = COALESCE(${t}.item_detail, '{}'::jsonb) || EXCLUDED.item_detail,
@@ -163,7 +186,7 @@ export async function saveItems(items: ProductDetails[]): Promise<SaveResult> {
         [
           r.store, r.store_product_id, r.item_name, r.item_price, r.item_upc, r.item_url,
           JSON.stringify(r.item_detail), r.item_nf === null ? null : JSON.stringify(r.item_nf),
-          r.item_ingredients, r.item_image,
+          r.item_ingredients, r.item_image, r.item_gtin,
         ],
       );
       result.saved++;
